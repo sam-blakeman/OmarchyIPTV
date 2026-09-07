@@ -1,0 +1,26 @@
+#!/bin/bash
+# Play an IPTV stream in external mpv. Keeps decoding out of omarchy-shell
+# so a bad stream can never take the bar down with it.
+#
+# Usage: iptv-play <url> [--title <name>]
+# Stopping = killing this process (QML sets playProc.running = false).
+
+set -u
+
+URL="${1:-}"
+TITLE="IPTV"
+if [[ "${2:-}" == "--title" ]]; then
+  TITLE="${3:-IPTV}"
+fi
+
+if [[ -z $URL ]]; then
+  echo "usage: iptv-play <url> [--title <name>]" >&2
+  exit 2
+fi
+
+if ! command -v mpv >/dev/null 2>&1; then
+  echo "iptv-play: mpv not found (omarchy pkg add mpv)" >&2
+  exit 127
+fi
+
+exec mpv --title="omarchy-iptv: $TITLE" --force-window=yes --keep-open=no "$URL"
