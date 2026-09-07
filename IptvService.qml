@@ -3,65 +3,68 @@ import Quickshell
 import Quickshell.Io
 import "IptvModel.js" as Model
 
-// Shared singleton for the IPTV plugin (service kind). Owns everything
-// both the quick panel and the fullscreen overlay need: provider data,
-// mpv playback, and favorites. BarWidget reaches it via
-// bar.shell.serviceFor("user.iptv"); the overlay gets it injected as
-// `service` by the shell panel loader.
-//
-// Favorites store only {kind, id, name} — stream URLs stay in the
-// mode-600 sync cache and are re-joined at render/play time, so no
-// credential-bearing URL ever lands in the favorites file.
 Item {
   id: root
 
   property var shell: null
 
+  readonly property string pluginId: "io.github.sam-blakeman.iptv"
   readonly property string home: Quickshell.env("HOME")
   readonly property string configDir: home + "/.config/omarchy-iptv"
   readonly property string favPath: configDir + "/favorites.json"
 
   property var channels: []
   property var vod: []
-  property var epgNow: []          // [{channel_id, name, now, next}] for the EPG tab
-  property var epgMap: ({})        // channel_id -> {now, next}, refreshed on a timer
+  property var liveGroups: ["All"]
+  property var vodGroups: ["All"]
+  property var favRows: []
+  property var epgNow: []
+  property var epgMap: ({})
   property bool epgLoaded: false
   property string statusLine: "IPTV"
-  property string lastError: ""    // last sync or playback failure, secrets redacted
+  property string lastError: ""
   property bool syncing: false
+  property bool savingProvider: false
+  property string vodGroup: "All"
+  property string vodQuery: ""
+  property int vodLimit: 400
 
-  // From --dump-status: cache freshness for the Setup tab and auto re-sync.
   property var status: ({})
   readonly property real syncedAtMs: status && status.synced_at ? status.synced_at * 1000 : 0
   readonly property bool providerConfigured: !!(status && status.provider)
-  // Re-sync once a day so the EPG window (now-2h..now+24h) never runs dry;
-  // checked hourly and once at startup so a laptop that was asleep catches up.
   property int syncIntervalMs: 24 * 3600 * 1000
 
   property var favorites: []
 
   readonly property bool playing: playProc.running
 
-  // Now/next is computed at dump time, so re-read it periodically or the
-  // guide freezes at whatever was on when the shell started. Only the
-  // small EPG map is reloaded — channel rows stay put, so open lists keep
-  // their scroll position.
   property int epgRefreshMs: 5 * 60 * 1000
 
+  function fileFromUrl(u) {
+    var s = String(u || "")
+    if (s.indexOf("file://") === 0) s = s.substring(7)
+    if (s.charAt(0) !== "/") {
+      var i = s.indexOf("/")
+      if (i >= 0) s = s.substring(i)
+    }
+    try { return decodeURIComponent(s) } catch (e) { return s }
+  }
   function helperPath() {
-    return Qt.resolvedUrl("bin/iptv-sync").toString().replace(/^file:\/\//, "")
+    return fileFromUrl(Qt.resolvedUrl("bin/iptv-sync").toString())
   }
   function playHelperPath() {
-    return Qt.resolvedUrl("bin/iptv-play").toString().replace(/^file:\/\//, "")
+    return fileFromUrl(Qt.resolvedUrl("bin/iptv-play").toString())
   }
 
   Component.onCompleted: loadAll()
 
   function loadAll() {
     if (!dumpChannelsProc.running) dumpChannelsProc.running = true
-    if (!dumpVodProc.running) dumpVodProc.running = true
+    if (!dumpLiveGroupsProc.running) dumpLiveGroupsProc.running = true
+    if (!dumpVodGroupsProc.running) dumpVodGroupsProc.running = true
     refreshEpg()
     refreshStatus()
+    refreshFavRows()
   }
 
   function refreshStatus() {
@@ -73,7 +76,6 @@ Item {
     if (Date.now() - root.syncedAtMs > root.syncIntervalMs) root.resync()
   }
 
-  // Stream URLs carry the Xtream password; never let one reach a label.
   function redact(text, url) {
     var s = String(text || "")
     if (url) s = s.split(url).join("<stream>")
@@ -92,17 +94,15 @@ Item {
     syncProc.running = true
   }
 
-  function play(url, title) {
-    var cmd = [root.playHelperPath(), url, "--title", title || "IPTV"]
+  function play(id, title) {
+    if (!id) return
+    var cmd = [root.playHelperPath(), "--id", String(id), "--title", title || "IPTV"]
     root.statusLine = title || "Playing"
     if (playProc.running) {
-      // Re-setting command on a running Process is a no-op — stop first
-      // and let onExited launch the new stream once mpv is actually gone.
       playProc.pendingCommand = cmd
       playProc.stopRequested = true
       playProc.running = false
     } else {
-      playProc.currentUrl = url
       playProc.currentTitle = title || "IPTV"
       playProc.command = cmd
       playProc.running = true
@@ -116,12 +116,35 @@ Item {
   }
 
   function playChannel(ch) {
-    if (ch && ch.url) root.play(ch.url, ch.name)
+    if (ch && ch.id && ch.available !== false) root.play(ch.id, ch.name)
   }
 
-  // ---- EPG -----------------------------------------------------------------
-  // Rows carry epg_now/epg_next baked in at load; once the live map has
-  // arrived it wins, so a programme that ended is not shown as current.
+  function requestVod(group, query) {
+    root.vodGroup = group || "All"
+    root.vodQuery = query || ""
+    vodDebounce.restart()
+  }
+
+  function dumpVodNow() {
+    if (dumpVodProc.running) dumpVodProc.running = false
+    dumpVodProc.running = true
+  }
+
+  function saveProvider(cfg) {
+    if (!cfg || saveProvProc.running) return
+    var cmd = [root.helperPath(), "--write-provider", "--type", String(cfg.type || "")]
+    if (cfg.host) { cmd.push("--host"); cmd.push(String(cfg.host)) }
+    if (cfg.username) { cmd.push("--username"); cmd.push(String(cfg.username)) }
+    if (cfg.url) { cmd.push("--url"); cmd.push(String(cfg.url)) }
+    if (cfg.epg) { cmd.push("--epg"); cmd.push(String(cfg.epg)) }
+    if (cfg.user_agent) { cmd.push("--user-agent"); cmd.push(String(cfg.user_agent)) }
+    saveProvProc.form = cfg
+    saveProvProc.command = cmd
+    root.savingProvider = true
+    root.lastError = ""
+    saveProvProc.running = true
+  }
+
   function epgText(item) {
     if (!item) return ""
     if (!root.epgLoaded) return item.epg_now || ""
@@ -135,7 +158,6 @@ Item {
     return e ? e.next : ""
   }
 
-  // ---- favorites (logic lives in IptvModel.js) ----------------------------
   function isFav(kind, id) {
     return Model.isFavInList(root.favorites, kind, id)
   }
@@ -144,16 +166,28 @@ Item {
     if (!item || !item.id) return
     root.favorites = Model.toggleFavList(root.favorites, kind, item)
     saveFavorites()
+    refreshFavRows()
   }
 
   function saveFavorites() {
     favFile.setText(JSON.stringify(root.favorites) + "\n")
   }
 
-  // Join favorite refs against live data; stale ids surface with
-  // available:false so the UI can grey them instead of dropping them.
   function favItems(kind) {
-    return Model.resolveFavs(root.favorites, kind, kind === "vod" ? root.vod : root.channels)
+    return Model.resolveFavs(root.favorites, kind, root.favRows)
+  }
+
+  function refreshFavRows() {
+    var ids = []
+    var favs = root.favorites || []
+    for (var i = 0; i < favs.length; i++)
+      if (favs[i] && favs[i].id) ids.push(String(favs[i].id))
+    if (!ids.length) {
+      root.favRows = []
+      return
+    }
+    dumpFavProc.command = [root.helperPath(), "--dump-ids", ids.join(",")]
+    if (!dumpFavProc.running) dumpFavProc.running = true
   }
 
   function updateStatus() {
@@ -162,35 +196,29 @@ Item {
     root.statusLine = n > 0 ? n + " channels" : "No channels — see Setup"
   }
 
-  // ---- processes -----------------------------------------------------------
   Process {
     id: playProc
     running: false
     command: []
     property var pendingCommand: null
     property bool stopRequested: false
-    property string currentUrl: ""
     property string currentTitle: ""
     stderr: StdioCollector { id: playErr; waitForEnd: true }
     onExited: function(code, status) {
-      // mpv: 0 ok, 2 file could not be played, 4 quit by user/signal.
       var failed = !stopRequested && status === 0 && code !== 0 && code !== 4
       if (failed) {
         var lines = String(playErr.text || "").trim().split("\n").filter(function(l) { return l.trim() !== "" })
         var why = lines.length ? lines[lines.length - 1] : ("mpv exit " + code)
-        root.lastError = "Playback failed (" + currentTitle + "): " + root.redact(why, currentUrl)
+        root.lastError = "Playback failed (" + currentTitle + "): " + root.redact(why, "")
         root.statusLine = "Stream failed: " + currentTitle
       }
       stopRequested = false
       if (pendingCommand) {
         command = pendingCommand
-        currentUrl = pendingCommand[1]
-        currentTitle = pendingCommand[3] || "IPTV"
+        currentTitle = pendingCommand[4] || "IPTV"
         pendingCommand = null
         running = true
       } else if (!failed) {
-        // Natural exit (mpv window closed, or manual stop) — status back
-        // to the channel count.
         root.updateStatus()
       }
     }
@@ -212,13 +240,76 @@ Item {
   }
 
   Process {
+    id: dumpLiveGroupsProc
+    running: false
+    command: [root.helperPath(), "--dump-groups", "live"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var g = JSON.parse(text || "[]")
+          root.liveGroups = Array.isArray(g) && g.length ? g : ["All"]
+        } catch (e) { root.liveGroups = ["All"] }
+      }
+    }
+  }
+
+  Process {
+    id: dumpVodGroupsProc
+    running: false
+    command: [root.helperPath(), "--dump-groups", "vod"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var g = JSON.parse(text || "[]")
+          root.vodGroups = Array.isArray(g) && g.length ? g : ["All"]
+        } catch (e) { root.vodGroups = ["All"] }
+      }
+    }
+  }
+
+  Process {
     id: dumpVodProc
     running: false
-    command: [root.helperPath(), "--dump-vod"]
+    command: {
+      var cmd = [root.helperPath(), "--dump-vod", "--limit", String(root.vodLimit)]
+      if (root.vodGroup && root.vodGroup !== "All") {
+        cmd.push("--group")
+        cmd.push(root.vodGroup)
+      }
+      if (root.vodQuery) {
+        cmd.push("--query")
+        cmd.push(root.vodQuery)
+      }
+      return cmd
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try { root.vod = JSON.parse(text || "[]") } catch (e) { root.vod = [] }
+      }
+    }
+  }
+
+  Timer {
+    id: vodDebounce
+    interval: 180
+    repeat: false
+    onTriggered: root.dumpVodNow()
+  }
+
+  Process {
+    id: dumpFavProc
+    running: false
+    command: [root.helperPath(), "--dump-ids", ""]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var rows = JSON.parse(text || "[]")
+          root.favRows = Array.isArray(rows) ? rows : []
+        } catch (e) { root.favRows = [] }
       }
     }
   }
@@ -256,6 +347,30 @@ Item {
   }
 
   Process {
+    id: saveProvProc
+    running: false
+    stdinEnabled: true
+    property var form: ({})
+    command: [root.helperPath(), "--write-provider", "--type", "xtream"]
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: saveErr; waitForEnd: true }
+    onStarted: {
+      write(String((form && form.password) || "") + "\n")
+      form = ({})
+    }
+    onExited: function(code) {
+      root.savingProvider = false
+      if (code === 0) {
+        root.lastError = ""
+        root.resync()
+      } else {
+        var lines = String(saveErr.text || "").trim().split("\n")
+        root.lastError = "Save failed: " + (lines.length ? lines[lines.length - 1] : ("exit " + code))
+      }
+    }
+  }
+
+  Process {
     id: syncProc
     running: false
     command: [root.helperPath(), "--sync"]
@@ -266,8 +381,6 @@ Item {
       if (code === 0) {
         root.statusLine = "Synced"
       } else {
-        // iptv-sync redacts secrets before printing, so the last stderr
-        // line is safe to show in the Setup tab.
         var lines = String(syncErr.text || "").trim().split("\n")
         root.lastError = "Sync failed: " + (lines.length ? lines[lines.length - 1] : ("exit " + code))
         root.statusLine = "Sync failed — see Setup"
@@ -287,7 +400,7 @@ Item {
     interval: 3600 * 1000
     running: true
     repeat: true
-    onTriggered: root.refreshStatus() // -> maybeAutoSync once the dump lands
+    onTriggered: root.refreshStatus()
   }
 
   FileView {
@@ -301,6 +414,7 @@ Item {
         var v = JSON.parse(text() || "[]")
         root.favorites = Array.isArray(v) ? v : []
       } catch (e) { root.favorites = [] }
+      root.refreshFavRows()
     }
   }
 }

@@ -1,25 +1,21 @@
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import qs.Commons
 import qs.Ui
 import "IptvModel.js" as Model
 
-// Quick-browse panel: Live + VOD + EPG + Setup. All state comes from the
-// shared IptvService (injected as `service`); this file only renders.
-// Star buttons toggle favorites; the ★ Favorites group pins them on top.
-// All colors/type come from shell tokens (Color/Style) so the active
-// Omarchy theme applies live.
 Panel {
   id: root
-  moduleName: "user.iptv"
+  moduleName: "io.github.sam-blakeman.iptv"
   manageIpc: false
 
   property var anchorItem: null
   property var hostWidget: null
-  property var service: null
   readonly property var barIdentity: hostWidget || root
+  readonly property var service: hostWidget && hostWidget.svc ? hostWidget.svc : null
 
-  property string tab: "live" // live | vod | epg | setup
+  property string tab: "live"
   property string query: ""
   property string group: "All"
 
@@ -29,6 +25,15 @@ Panel {
   readonly property string statusLine: service ? service.statusLine : "IPTV"
   readonly property string lastError: service ? service.lastError : ""
   readonly property var syncStatus: service && service.status ? service.status : ({})
+  readonly property bool providerConfigured: !!(syncStatus && syncStatus.provider)
+
+  property string formType: "xtream"
+  property string formHost: ""
+  property string formUser: ""
+  property string formPassword: ""
+  property string formUrl: ""
+  property string formEpg: ""
+  property string formUa: ""
 
   function ago(ms) {
     if (!ms) return "never"
@@ -50,21 +55,81 @@ Panel {
     return out + " · auto re-sync daily"
   }
   readonly property bool syncing: service ? service.syncing === true : false
+  readonly property bool savingProvider: service ? service.savingProvider === true : false
 
   readonly property string favGroup: "★ Favorites"
+  readonly property var sourceGroups: {
+    var g = root.tab === "vod"
+      ? (service && service.vodGroups ? service.vodGroups : ["All"])
+      : (service && service.liveGroups ? service.liveGroups : Model.groups(root.channels))
+    return g && g.length ? g : ["All"]
+  }
+  readonly property var groupList: [root.favGroup].concat(sourceGroups.filter(function(g) { return g !== root.favGroup }))
   readonly property var livePool: root.group === root.favGroup && service ? service.favItems("live") : root.channels
-  readonly property var vodPool: root.group === root.favGroup && service ? service.favItems("vod") : root.vod
   readonly property var visibleChannels: Model.filterChannels(livePool, query, root.group === root.favGroup ? "All" : group)
-  readonly property var visibleVod: Model.filterChannels(vodPool, query, root.group === root.favGroup ? "All" : group)
-  readonly property var groupList: [root.favGroup].concat(Model.groups(tab === "vod" ? vod : channels))
+  readonly property var visibleVod: root.group === root.favGroup && service ? service.favItems("vod") : root.vod
+  readonly property bool vodNeedsQuery: root.tab === "vod" && root.group !== root.favGroup && root.group === "All" && String(root.query).trim() === ""
+  readonly property string emptyHint: {
+    if (root.tab === "setup") return ""
+    if (!root.providerConfigured) return "Add a provider in Setup."
+    if (root.syncing) return "Syncing…"
+    if (root.tab === "vod" && root.vodNeedsQuery) return "Pick a group or type to search VOD."
+    if (root.tab === "live" && root.visibleChannels.length === 0) return "No channels match."
+    if (root.tab === "vod" && root.visibleVod.length === 0) return "No titles match."
+    if (root.tab === "epg" && root.epgNow.length === 0) return "No guide data yet. Sync from Setup."
+    return ""
+  }
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
-  // Live and VOD have different group sets; don't carry a group that no
-  // longer exists across a tab switch.
-  onTabChanged: if (root.groupList.indexOf(root.group) === -1) root.group = "All"
-  onGroupChanged: groupPicker.value = root.group
+  onTabChanged: {
+    if (root.groupList.indexOf(root.group) === -1) root.group = "All"
+    if (root.tab === "setup") root.fillForm()
+    root.maybeRequestVod()
+  }
+  onGroupChanged: {
+    groupPicker.value = root.group
+    root.maybeRequestVod()
+  }
+  onQueryChanged: root.maybeRequestVod()
+
+  function maybeRequestVod() {
+    if (root.tab !== "vod" || !service || !service.requestVod) return
+    if (root.group === root.favGroup) return
+    service.requestVod(root.group, root.query)
+  }
+
+  function fillForm() {
+    var s = root.syncStatus || ({})
+    if (s.provider) root.formType = s.provider
+    root.formHost = s.host || ""
+    root.formUser = s.username || ""
+    root.formUrl = s.url || ""
+    root.formEpg = s.epg || ""
+    root.formUa = s.user_agent || ""
+    root.formPassword = ""
+    if (hostField) hostField.text = root.formHost
+    if (userField) userField.text = root.formUser
+    if (passwordField) passwordField.text = ""
+    if (urlField) urlField.text = root.formUrl
+    if (epgField) epgField.text = root.formEpg
+    if (uaField) uaField.text = root.formUa
+  }
+
+  function saveForm() {
+    if (!service || !service.saveProvider) return
+    service.saveProvider({
+      type: root.formType,
+      host: root.formHost,
+      username: root.formUser,
+      password: root.formPassword,
+      url: root.formUrl,
+      epg: root.formEpg,
+      user_agent: root.formUa
+    })
+    root.formPassword = ""
+  }
 
   function open() { root.controller.show() }
   function close() { root.controller.hide() }
@@ -79,12 +144,12 @@ Panel {
     if (service && service.resync) service.resync()
   }
   function playChannel(ch) {
-    if (!ch || !ch.url || ch.available === false) return
+    if (!ch || !ch.id || ch.available === false) return
     if (service && service.playChannel) service.playChannel(ch)
   }
-  function playItem(it) {
-    if (!it || !it.url || it.available === false) return
-    if (service && service.play) service.play(it.url, it.name)
+  function playById(id, name) {
+    if (!id || !service || !service.play) return
+    service.play(id, name)
   }
   function toggleFav(kind, item) {
     if (service && service.toggleFav) service.toggleFav(kind, item)
@@ -124,8 +189,7 @@ Panel {
         anchors.margins: Style.space(12)
         spacing: Style.space(8)
 
-        // Header
-        Row {
+        RowLayout {
           width: parent.width
           spacing: Style.space(8)
           Text {
@@ -137,14 +201,14 @@ Panel {
             font.bold: true
           }
           Text {
+            Layout.fillWidth: true
+            elide: Text.ElideRight
             textFormat: Text.PlainText
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.syncing ? "syncing…" : root.statusLine
+            text: root.syncing ? "syncing…" : (root.savingProvider ? "saving…" : root.statusLine)
             color: Color.muted
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
           }
-          Item { width: 1; height: 1 } // spacer
           PanelActionButton {
             iconText: "⛶"
             tooltipText: "Fullscreen TV mode"
@@ -154,13 +218,12 @@ Panel {
           }
         }
 
-        // Search + resync
-        Row {
+        RowLayout {
           width: parent.width
           spacing: Style.space(8)
           TextField {
             id: searchField
-            width: parent.width - resyncBtn.width - Style.space(8)
+            Layout.fillWidth: true
             placeholderText: "Search channels / VOD…"
             foreground: root.contentForeground
             font.family: root.contentFontFamily
@@ -176,41 +239,35 @@ Panel {
           }
         }
 
-        // Tabs
-        Row {
+        ButtonGroup {
           width: parent.width
-          spacing: Style.space(4)
-          Repeater {
-            model: ["live", "vod", "epg", "setup"]
-            Button {
-              required property string modelData
-              text: modelData
-              tooltipText: modelData
-              selected: root.tab === modelData
-              fontFamily: root.contentFontFamily
-              onClicked: root.tab = modelData
-            }
-          }
+          value: root.tab
+          focusable: false
+          foreground: root.contentForeground
+          fontFamily: root.contentFontFamily
+          options: [
+            { value: "live", label: "Live" },
+            { value: "vod", label: "VOD" },
+            { value: "epg", label: "Guide" },
+            { value: "setup", label: "Setup" }
+          ]
+          onChanged: function(v) { root.tab = v }
         }
 
-        // Group filter (live/vod). Playlists routinely have 50-100 groups,
-        // so a searchable picker instead of a row of the first few.
-        Row {
+        RowLayout {
           visible: root.tab === "live" || root.tab === "vod"
           width: parent.width
           spacing: Style.space(8)
           Text {
-            id: groupLabel
-            anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: "Group:"
+            text: "Group"
             color: Color.muted
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
           }
           SearchableDropdown {
             id: groupPicker
-            width: parent.width - groupLabel.width - Style.space(8)
+            Layout.fillWidth: true
             showLabel: false
             placeholderText: "Search groups…"
             fontFamily: root.contentFontFamily
@@ -220,7 +277,17 @@ Panel {
           }
         }
 
-        // Live list
+        Text {
+          visible: root.emptyHint !== "" && root.tab !== "setup"
+          width: parent.width
+          wrapMode: Text.WordWrap
+          textFormat: Text.PlainText
+          text: root.emptyHint
+          color: Color.muted
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
         ListView {
           visible: root.tab === "live"
           width: parent.width
@@ -230,7 +297,6 @@ Panel {
           delegate: channelDelegate
         }
 
-        // VOD list
         ListView {
           visible: root.tab === "vod"
           width: parent.width
@@ -240,7 +306,6 @@ Panel {
           delegate: vodDelegate
         }
 
-        // EPG now/next
         ListView {
           visible: root.tab === "epg"
           width: parent.width
@@ -250,54 +315,141 @@ Panel {
           delegate: epgDelegate
         }
 
-        // Setup
-        Column {
+        Flickable {
           visible: root.tab === "setup"
           width: parent.width
-          spacing: Style.space(6)
-          Text {
+          height: parent.height - y
+          clip: true
+          contentWidth: width
+          contentHeight: setupCol.implicitHeight
+          boundsBehavior: Flickable.StopAtBounds
+
+          Column {
+            id: setupCol
             width: parent.width
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            text: root.statusSummary()
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-          Text {
-            visible: root.lastError !== ""
-            width: parent.width
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            text: root.lastError
-            color: Color.accent
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-          Text {
-            width: parent.width
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            text: "Single provider. Edit ~/.config/omarchy-iptv/provider.json then press 󰑓.\n\nm3u: {\"type\":\"m3u\",\"url\":\"…m3u\",\"epg\":\"…xmltv\"}\nxtream: {\"type\":\"xtream\",\"host\":\"http://h:8080\",\"username\":\"u\"} + secret-tool store --label omarchy-iptv application user.iptv username <user>\n\nOptional \"user_agent\" key if the provider whitelists one."
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-          }
-          Text {
-            width: parent.width
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            text: "★ " + (service ? service.favorites.length : 0) + " favorites (stored in ~/.config/omarchy-iptv/favorites.json) • Cache: ~/.cache/omarchy-iptv/ • Playback: external mpv via bin/iptv-play"
-            color: Color.muted
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.statusSummary()
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              visible: root.lastError !== ""
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: root.lastError
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            ButtonGroup {
+              width: parent.width
+              value: root.formType
+              focusable: false
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              options: [
+                { value: "xtream", label: "Xtream" },
+                { value: "m3u", label: "M3U" }
+              ]
+              onChanged: function(v) { root.formType = v }
+            }
+
+            TextField {
+              id: hostField
+              visible: root.formType === "xtream"
+              width: parent.width
+              placeholderText: "Host (http://host:port)"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formHost = text
+            }
+            TextField {
+              id: userField
+              visible: root.formType === "xtream"
+              width: parent.width
+              placeholderText: "Username"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formUser = text
+            }
+            TextField {
+              id: passwordField
+              visible: root.formType === "xtream"
+              width: parent.width
+              password: true
+              placeholderText: (root.syncStatus && root.syncStatus.has_password) ? "Password (unchanged)" : "Password"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formPassword = text
+            }
+            TextField {
+              id: urlField
+              visible: root.formType === "m3u"
+              width: parent.width
+              placeholderText: "Playlist URL"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formUrl = text
+            }
+            TextField {
+              id: epgField
+              visible: root.formType === "m3u"
+              width: parent.width
+              placeholderText: "EPG URL (optional)"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formEpg = text
+            }
+            TextField {
+              id: uaField
+              width: parent.width
+              placeholderText: "User-Agent (optional)"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              onTextChanged: root.formUa = text
+            }
+
+            Button {
+              text: root.savingProvider ? "Saving…" : "Save & sync"
+              tooltipText: "Write provider and re-sync"
+              enabled: !root.savingProvider && !root.syncing
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onClicked: root.saveForm()
+            }
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "★ " + (service ? service.favorites.length : 0) + " favorites · Playback in external mpv · Password stays in the keyring"
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "Use only playlists and accounts you are authorized to access. This plugin does not provide streams. Unauthorized use is your responsibility."
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
         }
       }
     }
   }
 
-  // --- Delegates (theme-only colors) ---------------------------------------
   Component {
     id: channelDelegate
     Item {
@@ -380,7 +532,7 @@ Panel {
         anchors.fill: parent
         anchors.leftMargin: Style.space(30)
         cursorShape: Qt.PointingHandCursor
-        onClicked: root.playItem(modelData)
+        onClicked: root.playChannel(modelData)
       }
     }
   }
@@ -414,6 +566,11 @@ Panel {
           elide: Text.ElideRight
           width: parent.width
         }
+      }
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.playById(modelData.channel_id, modelData.name)
       }
     }
   }

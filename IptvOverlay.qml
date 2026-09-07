@@ -5,13 +5,6 @@ import qs.Commons
 import qs.Ui
 import "IptvModel.js" as Model
 
-// Fullscreen 10-foot TV browser (overlay kind). Summoned via
-// `omarchy-shell shell summon user.iptv`, the ⛶ button in the quick
-// panel, or SUPER+... bound to that summon. Shares IptvService with the
-// bar widget (injected as `service` by the shell panel loader).
-//
-// Remote/keyboard-first: ↑↓ move, ←→ change group, Enter plays, Ctrl+F
-// favorites, Tab switches Live/VOD, typing filters, Esc backs out.
 Item {
   id: root
 
@@ -20,13 +13,19 @@ Item {
   property var manifest: null
   property var service: null
 
+  readonly property string pluginId: (manifest && manifest.id) || "io.github.sam-blakeman.iptv"
+  readonly property var svc: {
+    if (service && service.playChannel) return service
+    var map = shell && shell._services
+    return (map && map[root.pluginId]) || null
+  }
+
   property bool opened: false
-  property string tab: "live" // live | vod
+  property string tab: "live"
   property string filterText: ""
   property string group: "All"
   property int selectedIndex: 0
 
-  // Menu surface tokens — themes that style the menu style this too.
   property color background: Color.menu.background
   property color foreground: Color.menu.text
   property color border: Color.menu.border
@@ -36,23 +35,40 @@ Item {
   property color selectedText: Color.menu.selectedText
   readonly property int cornerRadius: Style.cornerRadius
   property string fontFamily: Style.font.menuFamily
+  readonly property color mutedText: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.58)
 
   readonly property string favGroup: "★ Favorites"
-  readonly property var basePool: root.tab === "vod" ? (service ? service.vod : []) : (service ? service.channels : [])
-  readonly property var pool: root.group === root.favGroup && service ? service.favItems(root.tab) : basePool
-  readonly property var rows: Model.filterChannels(pool, filterText, root.group === root.favGroup ? "All" : group)
-  readonly property var groupList: [root.favGroup].concat(Model.groups(basePool))
+  readonly property var sourceGroups: {
+    var g = root.tab === "vod"
+      ? (svc && svc.vodGroups ? svc.vodGroups : ["All"])
+      : (svc && svc.liveGroups ? svc.liveGroups : Model.groups(svc ? svc.channels : []))
+    return g && g.length ? g : ["All"]
+  }
+  readonly property var groupList: [root.favGroup].concat(sourceGroups.filter(function(g) { return g !== root.favGroup }))
+  readonly property var livePool: root.group === root.favGroup && svc ? svc.favItems("live") : (svc ? svc.channels : [])
+  readonly property var rows: root.tab === "vod"
+    ? (root.group === root.favGroup && svc ? svc.favItems("vod") : (svc ? svc.vod : []))
+    : Model.filterChannels(livePool, filterText, root.group === root.favGroup ? "All" : group)
   readonly property var selected: rows.length > 0 ? rows[Math.min(root.selectedIndex, rows.length - 1)] : null
+  readonly property bool vodNeedsQuery: root.tab === "vod" && root.group !== root.favGroup && root.group === "All" && String(root.filterText).trim() === ""
 
-  // Keep the highlight on a real row when a filter shrinks the list, so
-  // Enter always plays what is highlighted.
   onRowsChanged: if (root.selectedIndex > rows.length - 1) root.selectedIndex = Math.max(0, rows.length - 1)
+  onTabChanged: root.maybeRequestVod()
+  onGroupChanged: root.maybeRequestVod()
+  onFilterTextChanged: root.maybeRequestVod()
+
+  function maybeRequestVod() {
+    if (root.tab !== "vod" || !svc || !svc.requestVod) return
+    if (root.group === root.favGroup) return
+    svc.requestVod(root.group, root.filterText)
+  }
 
   function open(payloadJson) {
     root.opened = true
     root.filterText = ""
     root.group = "All"
     root.selectedIndex = 0
+    root.maybeRequestVod()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   function close() {
@@ -61,7 +77,7 @@ Item {
   function dismiss() {
     root.opened = false
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "user.iptv")
+      root.shell.hide(root.pluginId)
   }
   function toggle() {
     if (root.opened) root.dismiss()
@@ -100,23 +116,22 @@ Item {
   }
   function activateCurrent() {
     var it = root.selected
-    if (!it || !it.url || it.available === false || !service) return
-    if (root.tab === "vod") service.play(it.url, it.name)
-    else service.playChannel(it)
+    if (!it || !it.id || it.available === false || !svc) return
+    svc.playChannel(it)
   }
   function favCurrent() {
     var it = root.selected
-    if (!it || !it.id || !service || !service.toggleFav) return
-    service.toggleFav(root.tab, it)
+    if (!it || !it.id || !svc || !svc.toggleFav) return
+    svc.toggleFav(root.tab, it)
   }
   function isFav(id) {
-    return service && service.isFav ? service.isFav(root.tab, id) : false
+    return svc && svc.isFav ? svc.isFav(root.tab, id) : false
   }
   function nowFor(item) {
-    return service && service.epgText ? service.epgText(item) : (item && item.epg_now ? item.epg_now : "")
+    return svc && svc.epgText ? svc.epgText(item) : (item && item.epg_now ? item.epg_now : "")
   }
   function nextFor(item) {
-    return service && service.epgNextText ? service.epgNextText(item) : (item && item.epg_next ? item.epg_next : "")
+    return svc && svc.epgNextText ? svc.epgNextText(item) : (item && item.epg_next ? item.epg_next : "")
   }
   function subtitleFor(item) {
     var now = root.nowFor(item)
@@ -191,7 +206,6 @@ Item {
             root.setTab(root.tab === "live" ? "vod" : "live")
             event.accepted = true
           } else if (event.key === Qt.Key_F && (event.modifiers & Qt.ControlModifier)) {
-            // Ctrl, not plain f: every letter is a filter character here.
             root.favCurrent()
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
@@ -212,7 +226,6 @@ Item {
         anchors.leftMargin: card.contentLeftInset
         spacing: Style.space(10)
 
-        // Header
         Row {
           width: parent.width
           spacing: Style.space(12)
@@ -227,36 +240,36 @@ Item {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            text: service ? service.statusLine : ""
-            color: Color.muted
+            text: svc ? svc.statusLine : ""
+            color: root.mutedText
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
           Item { width: 1; height: 1 }
-          Text {
+          ButtonGroup {
             anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            text: root.tab === "live" ? "LIVE" : "VOD"
-            color: Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            font.bold: true
+            value: root.tab
+            focusable: false
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            options: [
+              { value: "live", label: "Live" },
+              { value: "vod", label: "VOD" }
+            ]
+            onChanged: function(v) { root.setTab(v) }
           }
         }
 
-        // Filter line
         Text {
           width: parent.width
           textFormat: Text.PlainText
           text: root.filterText !== "" ? "Filter: " + root.filterText + "  (" + rows.length + ")" : "Type to filter  (" + rows.length + ")"
-          color: Color.muted
+          color: root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
         }
 
-        // Groups: a scrolling strip so all of them are reachable; ←/→
-        // walks it from the keyboard.
         ListView {
           id: groupStrip
           width: parent.width
@@ -275,7 +288,16 @@ Item {
           }
         }
 
-        // Big rows — take whatever height is left above the footer.
+        Text {
+          visible: root.vodNeedsQuery || rows.length === 0
+          width: parent.width
+          textFormat: Text.PlainText
+          text: root.vodNeedsQuery ? "Pick a group or type to search VOD." : (rows.length === 0 ? "No matches." : "")
+          color: root.mutedText
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
         ListView {
           id: channelList
           width: parent.width
@@ -303,7 +325,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 textFormat: Text.PlainText
                 text: root.isFav(modelData.id) ? "★" : "☆"
-                color: root.isFav(modelData.id) ? Color.accent : Color.muted
+                color: root.isFav(modelData.id) ? Color.accent : root.mutedText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.subtitle
               }
@@ -324,7 +346,7 @@ Item {
                   width: parent.width
                   textFormat: Text.PlainText
                   text: root.subtitleFor(modelData)
-                  color: index === root.selectedIndex ? root.selectedText : Color.muted
+                  color: index === root.selectedIndex ? root.selectedText : root.mutedText
                   opacity: index === root.selectedIndex ? 0.85 : 1.0
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -345,14 +367,13 @@ Item {
           }
         }
 
-        // Footer hints
         Text {
           id: footer
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           textFormat: Text.PlainText
           text: "↑↓ move · ←→ group · Enter play · Ctrl+F favorite · Tab Live/VOD · type to filter · Esc close"
-          color: Color.muted
+          color: root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }

@@ -16,9 +16,9 @@ Only now-2h..now+24h of EPG is kept, so the shell never holds a week
 of listings in memory.
 
 NOTE: stream URLs for Xtream embed the password (required by the
-protocol). They are written to mode-600 cache files and emitted on
---dump-* for the QML player only. Error output is passed through
-redact() so a password can never reach the shell log.
+protocol). They stay in mode-600 cache files. --dump-* for the shell
+omits urls; --play-url looks one up at play time. Error output is
+passed through redact() so a password can never reach the shell log.
 """
 
 import argparse
@@ -45,7 +45,10 @@ CHANNELS_JSON = os.path.join(CACHE, "channels.json")
 VOD_JSON = os.path.join(CACHE, "vod.json")
 EPG_DB = os.path.join(CACHE, "epg.db")
 TIMEOUT = 60
-DEFAULT_UA = "omarchy-iptv/0.1"
+DEFAULT_UA = "omarchy-iptv/1.0"
+PLUGIN_ID = "io.github.sam-blakeman.iptv"
+SECRET_APP = PLUGIN_ID
+SECRET_APP_LEGACY = "user.iptv"
 
 # Strings that must never appear in stderr (filled in by sync_xtream).
 SECRETS = []
@@ -81,19 +84,28 @@ def load_provider():
         die(f"bad {CONFIG}: {e}")
 
 
-def get_password(prov):
-    username = prov["username"]
-    if os.environ.get("IPTV_PASSWORD"):
-        return os.environ["IPTV_PASSWORD"]
+def _secret_lookup(app, username):
     try:
         p = subprocess.run(
-            ["secret-tool", "lookup", "application", "user.iptv",
-             "username", username],
+            ["secret-tool", "lookup", "application", app, "username", username],
             capture_output=True, text=True, timeout=10)
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    return None
+
+
+def get_password(prov):
+    username = prov.get("username") or ""
+    if not username:
+        return None
+    if os.environ.get("IPTV_PASSWORD"):
+        return os.environ["IPTV_PASSWORD"]
+    for app in (SECRET_APP, SECRET_APP_LEGACY):
+        pw = _secret_lookup(app, username)
+        if pw:
+            return pw
     if prov.get("password"):
         mode = os.stat(CONFIG).st_mode & 0o777
         if mode & 0o077:
@@ -101,6 +113,62 @@ def get_password(prov):
                  "chmod 600 it")
         return prov["password"]
     return None
+
+
+def store_password(username, password):
+    if not username or not password:
+        return
+    try:
+        p = subprocess.run(
+            ["secret-tool", "store", "--label", "omarchy-iptv",
+             "application", SECRET_APP, "username", username],
+            input=password, capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        die(f"secret-tool store failed: {e}")
+    if p.returncode != 0:
+        die("secret-tool store failed: " + (p.stderr or p.stdout or "unknown error"))
+
+
+def write_provider(args):
+    t = (args.prov_type or "").strip()
+    if t not in ("m3u", "xtream"):
+        die("type must be m3u or xtream")
+    pw = ""
+    if not sys.stdin.isatty():
+        pw = sys.stdin.readline().rstrip("\n")
+    out = {"type": t}
+    ua = (args.user_agent or "").strip()
+    if ua:
+        out["user_agent"] = ua
+    if t == "xtream":
+        host = (args.host or "").strip().rstrip("/")
+        user = (args.username or "").strip()
+        if not host or not user:
+            die("xtream needs host and username")
+        if not host.startswith(("http://", "https://")):
+            host = "http://" + host
+        out["host"] = host
+        out["username"] = user
+        if pw:
+            store_password(user, pw)
+        elif not get_password(out):
+            die("xtream password missing")
+    else:
+        url = (args.url or "").strip()
+        if not url:
+            die("m3u needs url")
+        out["url"] = url
+        epg = (args.epg or "").strip()
+        if epg:
+            out["epg"] = epg
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(out, f)
+        f.write("\n")
+    os.replace(tmp, CONFIG)
+    os.chmod(CONFIG, 0o600)
+    print("wrote provider.json")
 
 
 # --- http -------------------------------------------------------------------
@@ -298,8 +366,8 @@ def sync_xtream(prov):
     ua = prov.get("user_agent")
     pw = get_password(prov)
     if not pw:
-        die("xtream password missing: secret-tool store --label omarchy-iptv "
-            f"application user.iptv username {user}  (or $IPTV_PASSWORD)")
+        die("xtream password missing: set it in Setup, or secret-tool store "
+            f"--label omarchy-iptv application {SECRET_APP} username {user}")
     SECRETS.append(pw)
     q_user, q_pw = urllib.parse.quote(user, safe=""), urllib.parse.quote(pw, safe="")
     api = f"{host}/player_api.php?username={q_user}&password={q_pw}"
@@ -360,27 +428,100 @@ def load_json(path):
 
 # --- dumps (QML reads these) -------------------------------------------------
 
-# Nothing in the shell renders logos yet, so they stay in the cache but
-# are dropped from the dumps: ~25% less JSON for the shell to parse.
-DUMP_DROP = ("logo",)
+# Logos and stream URLs stay in the 0600 cache. Dumps for the shell omit
+# both: urls carry Xtream passwords, and nothing in QML renders logos.
+DUMP_DROP = ("logo", "url")
 
 
 def slim(row):
     return {k: v for k, v in row.items() if k not in DUMP_DROP}
 
 
-def dump_channels():
-    channels = load_json(CHANNELS_JSON)
-    now, by_ch = epg_window()
+def row_matches(row, query, group):
+    if group and group != "All" and (row.get("group") or "Ungrouped") != group:
+        return False
+    if query:
+        name = (row.get("name") or "").lower()
+        if query.lower() not in name:
+            return False
+    return True
+
+
+def group_names(rows):
+    seen = {}
+    out = ["All"]
+    for c in rows or []:
+        g = c.get("group") or "Ungrouped"
+        if g not in seen:
+            seen[g] = True
+            out.append(g)
+    return out
+
+
+def dump_rows(path, query, group, limit, with_epg=False):
+    rows = load_json(path)
+    now, by_ch = (epg_window() if with_epg else (0, {}))
     out = []
-    for c in channels:
-        cur, nxt = now_next(by_ch.get(c.get("tvg_id") or "", []), now)
-        out.append({**slim(c), "epg_now": cur, "epg_next": nxt})
+    for c in rows:
+        if not row_matches(c, query, group):
+            continue
+        item = slim(c)
+        if with_epg:
+            cur, nxt = now_next(by_ch.get(c.get("tvg_id") or "", []), now)
+            item["epg_now"] = cur
+            item["epg_next"] = nxt
+        out.append(item)
+        if limit and len(out) >= limit:
+            break
     json.dump(out, sys.stdout)
 
 
-def dump_vod():
-    json.dump([slim(v) for v in load_json(VOD_JSON)], sys.stdout)
+def dump_channels(query="", group="", limit=0):
+    dump_rows(CHANNELS_JSON, query, group, limit, with_epg=True)
+
+
+def dump_vod(query="", group="", limit=0):
+    if not query and group in ("", "All"):
+        json.dump([], sys.stdout)
+        return
+    dump_rows(VOD_JSON, query, group, limit, with_epg=False)
+
+
+def dump_groups(kind):
+    path = VOD_JSON if kind == "vod" else CHANNELS_JSON
+    json.dump(group_names(load_json(path)), sys.stdout)
+
+
+def dump_ids(ids_csv):
+    want = {s for s in (ids_csv or "").split(",") if s}
+    if not want:
+        json.dump([], sys.stdout)
+        return
+    now, by_ch = epg_window()
+    out = []
+    for path, with_epg in ((CHANNELS_JSON, True), (VOD_JSON, False)):
+        for c in load_json(path):
+            if str(c.get("id")) not in want:
+                continue
+            item = slim(c)
+            if with_epg:
+                cur, nxt = now_next(by_ch.get(c.get("tvg_id") or "", []), now)
+                item["epg_now"] = cur
+                item["epg_next"] = nxt
+            out.append(item)
+    json.dump(out, sys.stdout)
+
+
+def play_url(sid):
+    sid = str(sid or "")
+    if not sid:
+        die("play-url needs --id", 2)
+    for path in (CHANNELS_JSON, VOD_JSON):
+        for row in load_json(path):
+            if str(row.get("id")) == sid and row.get("url"):
+                sys.stdout.write(row["url"])
+                return
+    die("unknown stream id", 2)
 
 
 def dump_status():
@@ -405,9 +546,23 @@ def dump_status():
                 db.close()
         except sqlite3.Error:
             pass
+    p = prov or {}
+    t = p.get("type") or ""
+    has_pw = False
+    if t == "xtream" and p.get("username"):
+        try:
+            has_pw = bool(get_password(p))
+        except SystemExit:
+            has_pw = False
     json.dump({
-        "provider": (prov or {}).get("type") or "",
-        "has_epg": bool(prov and (prov.get("type") == "xtream" or prov.get("epg"))),
+        "provider": t,
+        "host": p.get("host") or "",
+        "username": p.get("username") or "",
+        "url": p.get("url") or "",
+        "epg": p.get("epg") or "",
+        "user_agent": p.get("user_agent") or "",
+        "has_password": has_pw,
+        "has_epg": bool(t == "xtream" or p.get("epg")),
         "synced_at": synced_at,
         "channels": len(load_json(CHANNELS_JSON)),
         "vod": len(load_json(VOD_JSON)),
@@ -441,19 +596,41 @@ def main():
     g.add_argument("--dump-vod", action="store_true")
     g.add_argument("--dump-epg-now", action="store_true")
     g.add_argument("--dump-status", action="store_true")
+    g.add_argument("--dump-groups", choices=["live", "vod"])
+    g.add_argument("--dump-ids", metavar="IDS")
+    g.add_argument("--play-url", action="store_true")
+    g.add_argument("--write-provider", action="store_true")
+    ap.add_argument("--group", default="")
+    ap.add_argument("--query", default="")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--id", default="")
+    ap.add_argument("--type", dest="prov_type", default="")
+    ap.add_argument("--host", default="")
+    ap.add_argument("--username", default="")
+    ap.add_argument("--url", default="")
+    ap.add_argument("--epg", default="")
+    ap.add_argument("--user-agent", default="")
     a = ap.parse_args()
 
     # So the shell's favorites.json write never fails on a fresh install.
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
     if a.dump_channels:
-        dump_channels()
+        dump_channels(a.query, a.group, a.limit)
     elif a.dump_vod:
-        dump_vod()
+        dump_vod(a.query, a.group, a.limit)
     elif a.dump_epg_now:
         dump_epg_now()
     elif a.dump_status:
         dump_status()
+    elif a.dump_groups:
+        dump_groups(a.dump_groups)
+    elif a.dump_ids is not None:
+        dump_ids(a.dump_ids)
+    elif a.play_url:
+        play_url(a.id)
+    elif a.write_provider:
+        write_provider(a)
     else:
         prov = load_provider()
         if not prov:

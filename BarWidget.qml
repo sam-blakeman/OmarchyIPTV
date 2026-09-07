@@ -4,17 +4,17 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Bar entry point for the IPTV plugin (single provider, Live + VOD).
-// Shared state (channels, playback, favorites) lives in IptvService.qml;
-// this widget is a thin view over bar.shell.serviceFor("user.iptv").
-//
-// Left click toggles the quick-browse panel, middle click stops mpv,
-// right click re-syncs channels/EPG in the background.
 BarWidget {
   id: root
-  moduleName: "user.iptv"
+  moduleName: "io.github.sam-blakeman.iptv"
 
-  readonly property var svc: bar && bar.shell ? bar.shell.serviceFor(root.moduleName) : null
+  readonly property var svc: {
+    var sh = bar && bar.shell
+    if (!sh) return null
+    var map = sh._services
+    if (map && map[root.moduleName]) return map[root.moduleName]
+    return typeof sh.serviceFor === "function" ? sh.serviceFor(root.moduleName) : null
+  }
   readonly property string statusText: svc ? svc.statusLine : "IPTV"
   readonly property bool playing: svc ? svc.playing === true : false
   readonly property int favCount: svc ? svc.favorites.length : 0
@@ -51,7 +51,6 @@ BarWidget {
     if ("settings" in target) target.settings = root.settings
     if ("anchorItem" in target) target.anchorItem = button
     if ("hostWidget" in target) target.hostWidget = root
-    if ("service" in target) target.service = root.svc
   }
 
   implicitWidth: button.implicitWidth
@@ -73,7 +72,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "user.iptv"
+    target: "io.github.sam-blakeman.iptv"
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
@@ -89,7 +88,9 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.playing ? "󰑈 ●" : "󰑈"
-    tooltipText: root.statusText + (root.favCount > 0 ? " · ★" + root.favCount : "")
+    tooltipText: root.statusText
+      + (root.favCount > 0 ? " · ★" + root.favCount : "")
+      + " — click browse · middle stop · right sync"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.resync()
       else if (b === Qt.MiddleButton) root.stopPlayback()
