@@ -360,18 +360,60 @@ def load_json(path):
 
 # --- dumps (QML reads these) -------------------------------------------------
 
+# Nothing in the shell renders logos yet, so they stay in the cache but
+# are dropped from the dumps: ~25% less JSON for the shell to parse.
+DUMP_DROP = ("logo",)
+
+
+def slim(row):
+    return {k: v for k, v in row.items() if k not in DUMP_DROP}
+
+
 def dump_channels():
     channels = load_json(CHANNELS_JSON)
     now, by_ch = epg_window()
     out = []
     for c in channels:
         cur, nxt = now_next(by_ch.get(c.get("tvg_id") or "", []), now)
-        out.append({**c, "epg_now": cur, "epg_next": nxt})
+        out.append({**slim(c), "epg_now": cur, "epg_next": nxt})
     json.dump(out, sys.stdout)
 
 
 def dump_vod():
-    json.dump(load_json(VOD_JSON), sys.stdout)
+    json.dump([slim(v) for v in load_json(VOD_JSON)], sys.stdout)
+
+
+def dump_status():
+    """Cache freshness for the shell: drives auto re-sync and the Setup tab."""
+    prov = None
+    try:
+        prov = load_provider()
+    except SystemExit:
+        pass
+    try:
+        synced_at = int(os.stat(CHANNELS_JSON).st_mtime)
+    except OSError:
+        synced_at = 0
+    epg_count = epg_until = 0
+    if os.path.exists(EPG_DB):
+        try:
+            db = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
+            try:
+                epg_count, epg_until = db.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(end), 0) FROM programmes").fetchone()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            pass
+    json.dump({
+        "provider": (prov or {}).get("type") or "",
+        "has_epg": bool(prov and (prov.get("type") == "xtream" or prov.get("epg"))),
+        "synced_at": synced_at,
+        "channels": len(load_json(CHANNELS_JSON)),
+        "vod": len(load_json(VOD_JSON)),
+        "epg_programmes": epg_count,
+        "epg_until": epg_until,
+    }, sys.stdout)
 
 
 def dump_epg_now():
@@ -398,6 +440,7 @@ def main():
     g.add_argument("--dump-channels", action="store_true")
     g.add_argument("--dump-vod", action="store_true")
     g.add_argument("--dump-epg-now", action="store_true")
+    g.add_argument("--dump-status", action="store_true")
     a = ap.parse_args()
 
     # So the shell's favorites.json write never fails on a fresh install.
@@ -409,6 +452,8 @@ def main():
         dump_vod()
     elif a.dump_epg_now:
         dump_epg_now()
+    elif a.dump_status:
+        dump_status()
     else:
         prov = load_provider()
         if not prov:

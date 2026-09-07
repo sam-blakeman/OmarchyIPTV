@@ -35,5 +35,8 @@ fi
 # --force-media-title keeps the URL (which carries the password for Xtream)
 # out of mpv's OSD and title; --ytdl=no skips the yt-dlp probe on every
 # stream URL.
+# stderr carries only errors: the shell shows its last line when mpv
+# exits non-zero (after redacting the stream URL).
 exec mpv --title="omarchy-iptv: $TITLE" --force-media-title="$TITLE" \
-  --force-window=yes --keep-open=no --ytdl=no "${EXTRA[@]}" "$URL"
+  --force-window=yes --keep-open=no --ytdl=no --msg-level=all=error \
+  "${EXTRA[@]}" "$URL"

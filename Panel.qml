@@ -28,6 +28,27 @@ Panel {
   readonly property var epgNow: service ? service.epgNow : []
   readonly property string statusLine: service ? service.statusLine : "IPTV"
   readonly property string lastError: service ? service.lastError : ""
+  readonly property var syncStatus: service && service.status ? service.status : ({})
+
+  function ago(ms) {
+    if (!ms) return "never"
+    var m = Math.round((Date.now() - ms) / 60000)
+    if (m < 1) return "just now"
+    if (m < 60) return m + " min ago"
+    if (m < 48 * 60) return Math.round(m / 60) + " h ago"
+    return Math.round(m / 1440) + " d ago"
+  }
+  function statusSummary() {
+    var s = root.syncStatus
+    if (!s || !s.provider) return "No provider configured."
+    var out = s.provider + " · synced " + root.ago(service ? service.syncedAtMs : 0)
+      + " · " + (s.channels || 0) + " live, " + (s.vod || 0) + " vod"
+    if (s.has_epg) {
+      out += " · EPG " + (s.epg_programmes || 0) + " programmes"
+      if (s.epg_until) out += ", until " + new Date(s.epg_until * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
+    } else out += " · no EPG source"
+    return out + " · auto re-sync daily"
+  }
   readonly property bool syncing: service ? service.syncing === true : false
 
   readonly property string favGroup: "★ Favorites"
@@ -235,11 +256,20 @@ Panel {
           width: parent.width
           spacing: Style.space(6)
           Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.statusSummary()
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
             visible: root.lastError !== ""
             width: parent.width
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
-            text: "Last sync failed: " + root.lastError
+            text: root.lastError
             color: Color.accent
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.bodySmall

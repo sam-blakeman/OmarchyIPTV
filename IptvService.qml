@@ -27,8 +27,16 @@ Item {
   property var epgMap: ({})        // channel_id -> {now, next}, refreshed on a timer
   property bool epgLoaded: false
   property string statusLine: "IPTV"
-  property string lastError: ""    // last line of the last failed sync's stderr
+  property string lastError: ""    // last sync or playback failure, secrets redacted
   property bool syncing: false
+
+  // From --dump-status: cache freshness for the Setup tab and auto re-sync.
+  property var status: ({})
+  readonly property real syncedAtMs: status && status.synced_at ? status.synced_at * 1000 : 0
+  readonly property bool providerConfigured: !!(status && status.provider)
+  // Re-sync once a day so the EPG window (now-2h..now+24h) never runs dry;
+  // checked hourly and once at startup so a laptop that was asleep catches up.
+  property int syncIntervalMs: 24 * 3600 * 1000
 
   property var favorites: []
 
@@ -53,6 +61,23 @@ Item {
     if (!dumpChannelsProc.running) dumpChannelsProc.running = true
     if (!dumpVodProc.running) dumpVodProc.running = true
     refreshEpg()
+    refreshStatus()
+  }
+
+  function refreshStatus() {
+    if (!statusProc.running) statusProc.running = true
+  }
+
+  function maybeAutoSync() {
+    if (root.syncing || !root.providerConfigured) return
+    if (Date.now() - root.syncedAtMs > root.syncIntervalMs) root.resync()
+  }
+
+  // Stream URLs carry the Xtream password; never let one reach a label.
+  function redact(text, url) {
+    var s = String(text || "")
+    if (url) s = s.split(url).join("<stream>")
+    return s.replace(/https?:\/\/\S+/g, "<url>")
   }
 
   function refreshEpg() {
@@ -74,8 +99,11 @@ Item {
       // Re-setting command on a running Process is a no-op — stop first
       // and let onExited launch the new stream once mpv is actually gone.
       playProc.pendingCommand = cmd
+      playProc.stopRequested = true
       playProc.running = false
     } else {
+      playProc.currentUrl = url
+      playProc.currentTitle = title || "IPTV"
       playProc.command = cmd
       playProc.running = true
     }
@@ -83,6 +111,7 @@ Item {
 
   function stop() {
     playProc.pendingCommand = null
+    playProc.stopRequested = true
     playProc.running = false
   }
 
@@ -139,12 +168,27 @@ Item {
     running: false
     command: []
     property var pendingCommand: null
-    onExited: {
+    property bool stopRequested: false
+    property string currentUrl: ""
+    property string currentTitle: ""
+    stderr: StdioCollector { id: playErr; waitForEnd: true }
+    onExited: function(code, status) {
+      // mpv: 0 ok, 2 file could not be played, 4 quit by user/signal.
+      var failed = !stopRequested && status === 0 && code !== 0 && code !== 4
+      if (failed) {
+        var lines = String(playErr.text || "").trim().split("\n").filter(function(l) { return l.trim() !== "" })
+        var why = lines.length ? lines[lines.length - 1] : ("mpv exit " + code)
+        root.lastError = "Playback failed (" + currentTitle + "): " + root.redact(why, currentUrl)
+        root.statusLine = "Stream failed: " + currentTitle
+      }
+      stopRequested = false
       if (pendingCommand) {
         command = pendingCommand
+        currentUrl = pendingCommand[1]
+        currentTitle = pendingCommand[3] || "IPTV"
         pendingCommand = null
         running = true
-      } else {
+      } else if (!failed) {
         // Natural exit (mpv window closed, or manual stop) — status back
         // to the channel count.
         root.updateStatus()
@@ -199,6 +243,19 @@ Item {
   }
 
   Process {
+    id: statusProc
+    running: false
+    command: [root.helperPath(), "--dump-status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.status = JSON.parse(text || "{}") } catch (e) { root.status = ({}) }
+        root.maybeAutoSync()
+      }
+    }
+  }
+
+  Process {
     id: syncProc
     running: false
     command: [root.helperPath(), "--sync"]
@@ -212,7 +269,7 @@ Item {
         // iptv-sync redacts secrets before printing, so the last stderr
         // line is safe to show in the Setup tab.
         var lines = String(syncErr.text || "").trim().split("\n")
-        root.lastError = lines.length ? lines[lines.length - 1] : ("exit " + code)
+        root.lastError = "Sync failed: " + (lines.length ? lines[lines.length - 1] : ("exit " + code))
         root.statusLine = "Sync failed — see Setup"
       }
       root.loadAll()
@@ -224,6 +281,13 @@ Item {
     running: true
     repeat: true
     onTriggered: root.refreshEpg()
+  }
+
+  Timer {
+    interval: 3600 * 1000
+    running: true
+    repeat: true
+    onTriggered: root.refreshStatus() // -> maybeAutoSync once the dump lands
   }
 
   FileView {

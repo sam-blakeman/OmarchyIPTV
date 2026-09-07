@@ -53,6 +53,9 @@ Then press the bar 󰑓 button, or:
 * Right click bar icon: re-sync provider + EPG
 * Group picker is searchable (playlists routinely carry 50-100 groups)
 * Sync errors show in the Setup tab (secrets redacted before they reach the shell)
+* A stream mpv cannot open reports "Stream failed" in the bar and the mpv error in Setup
+* Setup shows cache age and EPG coverage; the provider re-syncs automatically once a day
+  (checked hourly and at shell start)
 
 ### Favorites
 
@@ -85,6 +88,8 @@ bin/iptv-play   # mpv wrapper
 ```
 
 Cache: `~/.cache/omarchy-iptv/` (`channels.json`, `vod.json`, `epg.db`, mode 600).
+`tvg-logo` URLs are kept in the cache but dropped from the dumps the shell
+parses; nothing renders them yet.
 XMLTV is stream-parsed (`iterparse`), so a week-long multi-MB guide never
 sits in memory as a DOM; only now-2h..now+24h is stored.
 No symlinks *inside* the plugin dir (shell validation rejects them); the
