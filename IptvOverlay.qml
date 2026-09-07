@@ -10,8 +10,8 @@ import "IptvModel.js" as Model
 // panel, or SUPER+... bound to that summon. Shares IptvService with the
 // bar widget (injected as `service` by the shell panel loader).
 //
-// Remote/keyboard-first: arrows move, Enter plays, f favorites,
-// Tab switches Live/VOD, typing filters, Esc backs out.
+// Remote/keyboard-first: ↑↓ move, ←→ change group, Enter plays, Ctrl+F
+// favorites, Tab switches Live/VOD, typing filters, Esc backs out.
 Item {
   id: root
 
@@ -38,12 +38,15 @@ Item {
   property string fontFamily: Style.font.menuFamily
 
   readonly property string favGroup: "★ Favorites"
-  readonly property var pool: root.group === root.favGroup && service
-    ? service.favItems(root.tab)
-    : (root.tab === "vod" ? (service ? service.vod : []) : (service ? service.channels : []))
+  readonly property var basePool: root.tab === "vod" ? (service ? service.vod : []) : (service ? service.channels : [])
+  readonly property var pool: root.group === root.favGroup && service ? service.favItems(root.tab) : basePool
   readonly property var rows: Model.filterChannels(pool, filterText, root.group === root.favGroup ? "All" : group)
-  readonly property var groupList: [root.favGroup].concat(Model.groups(root.tab === "vod" ? (service ? service.vod : []) : (service ? service.channels : [])))
+  readonly property var groupList: [root.favGroup].concat(Model.groups(basePool))
   readonly property var selected: rows.length > 0 ? rows[Math.min(root.selectedIndex, rows.length - 1)] : null
+
+  // Keep the highlight on a real row when a filter shrinks the list, so
+  // Enter always plays what is highlighted.
+  onRowsChanged: if (root.selectedIndex > rows.length - 1) root.selectedIndex = Math.max(0, rows.length - 1)
 
   function open(payloadJson) {
     root.opened = true
@@ -68,6 +71,15 @@ Item {
   function setGroup(g) {
     root.group = g
     root.selectedIndex = 0
+    var i = root.groupList.indexOf(g)
+    if (i >= 0) groupStrip.positionViewAtIndex(i, ListView.Contain)
+  }
+  function cycleGroup(d) {
+    var list = root.groupList
+    if (list.length === 0) return
+    var i = list.indexOf(root.group)
+    if (i < 0) i = 0
+    root.setGroup(list[(i + d + list.length) % list.length])
   }
   function setTab(t) {
     root.tab = t
@@ -99,6 +111,18 @@ Item {
   }
   function isFav(id) {
     return service && service.isFav ? service.isFav(root.tab, id) : false
+  }
+  function nowFor(item) {
+    return service && service.epgText ? service.epgText(item) : (item && item.epg_now ? item.epg_now : "")
+  }
+  function nextFor(item) {
+    return service && service.epgNextText ? service.epgNextText(item) : (item && item.epg_next ? item.epg_next : "")
+  }
+  function subtitleFor(item) {
+    var now = root.nowFor(item)
+    if (!now) return item.group || ""
+    var next = root.nextFor(item)
+    return next ? now + "  ▸ " + next : now
   }
 
   PanelWindow {
@@ -154,17 +178,27 @@ Item {
           } else if (event.key === Qt.Key_PageDown) {
             root.move(10)
             event.accepted = true
+          } else if (event.key === Qt.Key_Left) {
+            root.cycleGroup(-1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right) {
+            root.cycleGroup(1)
+            event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.activateCurrent()
             event.accepted = true
-          } else if (event.key === Qt.Key_Tab) {
+          } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
             root.setTab(root.tab === "live" ? "vod" : "live")
             event.accepted = true
-          } else if (event.text === "f" || event.text === "F") {
+          } else if (event.key === Qt.Key_F && (event.modifiers & Qt.ControlModifier)) {
+            // Ctrl, not plain f: every letter is a filter character here.
             root.favCurrent()
             event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
+            event.accepted = true
+          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
+            root.setFilter(root.filterText + event.text)
             event.accepted = true
           }
         }
@@ -221,28 +255,31 @@ Item {
           elide: Text.ElideRight
         }
 
-        // Groups
-        Row {
+        // Groups: a scrolling strip so all of them are reachable; ←/→
+        // walks it from the keyboard.
+        ListView {
+          id: groupStrip
           width: parent.width
+          height: Style.spacing.controlHeight
+          orientation: ListView.Horizontal
           spacing: Style.space(6)
-          Repeater {
-            model: root.groupList.slice(0, 7)
-            Button {
-              required property string modelData
-              text: modelData
-              tooltipText: modelData
-              selected: root.group === modelData
-              fontFamily: root.fontFamily
-              onClicked: root.setGroup(modelData)
-            }
+          clip: true
+          model: root.groupList
+          delegate: Button {
+            required property string modelData
+            text: modelData
+            tooltipText: modelData
+            selected: root.group === modelData
+            fontFamily: root.fontFamily
+            onClicked: root.setGroup(modelData)
           }
         }
 
-        // Big rows
+        // Big rows — take whatever height is left above the footer.
         ListView {
           id: channelList
           width: parent.width
-          height: Style.space(380)
+          height: parent.height - y - footer.height - parent.spacing
           clip: true
           model: root.rows
           currentIndex: root.selectedIndex
@@ -286,7 +323,7 @@ Item {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: modelData.epg_now ? modelData.epg_now + (modelData.epg_next ? "  ▸ " + modelData.epg_next : "") : (modelData.group || "")
+                  text: root.subtitleFor(modelData)
                   color: index === root.selectedIndex ? root.selectedText : Color.muted
                   opacity: index === root.selectedIndex ? 0.85 : 1.0
                   font.family: root.fontFamily
@@ -310,10 +347,11 @@ Item {
 
         // Footer hints
         Text {
+          id: footer
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           textFormat: Text.PlainText
-          text: "↑↓ move · Enter play · f favorite · Tab Live/VOD · Esc close"
+          text: "↑↓ move · ←→ group · Enter play · Ctrl+F favorite · Tab Live/VOD · type to filter · Esc close"
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

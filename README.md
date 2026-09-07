@@ -10,12 +10,12 @@ Lightweight single-provider IPTV browser for Omarchy Quattro.
 ## Install
 
 ```sh
-# dev checkout
+# dev checkout (or `omarchy plugin add <url>` once published)
 git clone https://github.com/sam-blakeman/OmarchyIPTV.git ~/.config/omarchy/plugins/user.iptv
 omarchy plugin validate ~/.config/omarchy/plugins/user.iptv
 omarchy plugin enable user.iptv --section right
 
-omarchy pkg add mpv python3
+omarchy pkg add mpv python
 ```
 
 ## Configure (single provider)
@@ -31,6 +31,9 @@ Xtream:
 ```json
 {"type": "xtream", "host": "http://host:8080", "username": "myuser"}
 ```
+
+Either type accepts an optional `"user_agent"` key; the sync and mpv both
+send it, for providers that whitelist a player UA.
 ```sh
 secret-tool store --label 'omarchy-iptv' application user.iptv username myuser
 # else $IPTV_PASSWORD, else "password" key in provider.json (discouraged)
@@ -48,18 +51,24 @@ Then press the bar 󰑓 button, or:
 * Click / Enter on a row: play in external mpv
 * Middle click bar icon: stop mpv
 * Right click bar icon: re-sync provider + EPG
+* Group picker is searchable (playlists routinely carry 50-100 groups)
+* Sync errors show in the Setup tab (secrets redacted before they reach the shell)
 
 ### Favorites
 
-☆/★ per row (or `f` in fullscreen). Stored as `{kind, id, name}` refs in
+☆/★ per row (or `Ctrl+F` in fullscreen). Stored as `{kind, id, name}` refs in
 `~/.config/omarchy-iptv/favorites.json` — no stream URLs, so no
 credential-bearing Xtream URLs touch the file. Pinned under the
 ★ Favorites group in both panel and fullscreen.
 
+m3u ids are a hash of url + name + group, so they survive playlist
+re-ordering and stay distinct when several streams share one `tvg-id`.
+
 ### Fullscreen TV mode
 
-Keyboard-first: ↑↓ move · Enter play · f favorite · Tab Live/VOD ·
-type to filter · Esc back out. Themed with the `[menu]` surface tokens,
+Keyboard-first: ↑↓ move · ←→ group · Enter play · Ctrl+F favorite ·
+Tab Live/VOD · type to filter · Esc back out. Now/next refreshes from the
+cache every 5 minutes without disturbing the list. Themed with the `[menu]` surface tokens,
 so it follows the active Omarchy theme like the emoji picker.
 
 ## Layout
@@ -76,7 +85,10 @@ bin/iptv-play   # mpv wrapper
 ```
 
 Cache: `~/.cache/omarchy-iptv/` (`channels.json`, `vod.json`, `epg.db`, mode 600).
-No symlinks in the plugin dir (shell validation rejects them).
+XMLTV is stream-parsed (`iterparse`), so a week-long multi-MB guide never
+sits in memory as a DOM; only now-2h..now+24h is stored.
+No symlinks *inside* the plugin dir (shell validation rejects them); the
+plugin dir itself may be a symlink to a dev checkout.
 
 ## Remove
 

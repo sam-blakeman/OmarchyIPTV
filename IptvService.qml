@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "IptvModel.js" as Model
 
 // Shared singleton for the IPTV plugin (service kind). Owns everything
 // both the quick panel and the fullscreen overlay need: provider data,
@@ -22,13 +23,22 @@ Item {
 
   property var channels: []
   property var vod: []
-  property var epgNow: []
+  property var epgNow: []          // [{channel_id, name, now, next}] for the EPG tab
+  property var epgMap: ({})        // channel_id -> {now, next}, refreshed on a timer
+  property bool epgLoaded: false
   property string statusLine: "IPTV"
+  property string lastError: ""    // last line of the last failed sync's stderr
   property bool syncing: false
 
   property var favorites: []
 
   readonly property bool playing: playProc.running
+
+  // Now/next is computed at dump time, so re-read it periodically or the
+  // guide freezes at whatever was on when the shell started. Only the
+  // small EPG map is reloaded — channel rows stay put, so open lists keep
+  // their scroll position.
+  property int epgRefreshMs: 5 * 60 * 1000
 
   function helperPath() {
     return Qt.resolvedUrl("bin/iptv-sync").toString().replace(/^file:\/\//, "")
@@ -42,12 +52,17 @@ Item {
   function loadAll() {
     if (!dumpChannelsProc.running) dumpChannelsProc.running = true
     if (!dumpVodProc.running) dumpVodProc.running = true
+    refreshEpg()
+  }
+
+  function refreshEpg() {
     if (!dumpEpgProc.running) dumpEpgProc.running = true
   }
 
   function resync() {
     if (syncProc.running) return
     root.syncing = true
+    root.lastError = ""
     root.statusLine = "Syncing…"
     syncProc.running = true
   }
@@ -69,36 +84,36 @@ Item {
   function stop() {
     playProc.pendingCommand = null
     playProc.running = false
-    root.updateStatus()
   }
 
   function playChannel(ch) {
     if (ch && ch.url) root.play(ch.url, ch.name)
   }
 
-  // ---- favorites ---------------------------------------------------------
-  function favKey(kind, id) {
-    return String(kind) + ":" + String(id)
+  // ---- EPG -----------------------------------------------------------------
+  // Rows carry epg_now/epg_next baked in at load; once the live map has
+  // arrived it wins, so a programme that ended is not shown as current.
+  function epgText(item) {
+    if (!item) return ""
+    if (!root.epgLoaded) return item.epg_now || ""
+    var e = root.epgMap[String(item.id)]
+    return e ? e.now : ""
+  }
+  function epgNextText(item) {
+    if (!item) return ""
+    if (!root.epgLoaded) return item.epg_next || ""
+    var e = root.epgMap[String(item.id)]
+    return e ? e.next : ""
   }
 
+  // ---- favorites (logic lives in IptvModel.js) ----------------------------
   function isFav(kind, id) {
-    var k = root.favKey(kind, id)
-    for (var i = 0; i < root.favorites.length; i++)
-      if (root.favKey(root.favorites[i].kind, root.favorites[i].id) === k) return true
-    return false
+    return Model.isFavInList(root.favorites, kind, id)
   }
 
   function toggleFav(kind, item) {
     if (!item || !item.id) return
-    var k = root.favKey(kind, item.id)
-    var next = []
-    var found = false
-    for (var i = 0; i < root.favorites.length; i++) {
-      if (root.favKey(root.favorites[i].kind, root.favorites[i].id) === k) found = true
-      else next.push(root.favorites[i])
-    }
-    if (!found) next.push({ kind: kind, id: item.id, name: item.name || String(item.id) })
-    root.favorites = next
+    root.favorites = Model.toggleFavList(root.favorites, kind, item)
     saveFavorites()
   }
 
@@ -109,30 +124,13 @@ Item {
   // Join favorite refs against live data; stale ids surface with
   // available:false so the UI can grey them instead of dropping them.
   function favItems(kind) {
-    var pool = kind === "vod" ? root.vod : root.channels
-    var byId = {}
-    for (var i = 0; i < pool.length; i++) byId[String(pool[i].id)] = pool[i]
-    var out = []
-    for (var j = 0; j < root.favorites.length; j++) {
-      var f = root.favorites[j]
-      if (f.kind !== kind) continue
-      var hit = byId[String(f.id)]
-      if (hit) out.push(hit)
-      else out.push({ id: f.id, name: f.name, url: "", available: false })
-    }
-    return out
-  }
-
-  function epgFor(channelId) {
-    for (var i = 0; i < (root.epgNow || []).length; i++)
-      if (root.epgNow[i].channel_id === channelId) return root.epgNow[i]
-    return null
+    return Model.resolveFavs(root.favorites, kind, kind === "vod" ? root.vod : root.channels)
   }
 
   function updateStatus() {
+    if (root.playing) return
     var n = (root.channels || []).length
-    if (n > 0 && !root.playing) root.statusLine = n + " channels"
-    else if (n === 0 && !root.playing) root.statusLine = "No channels — see Setup"
+    root.statusLine = n > 0 ? n + " channels" : "No channels — see Setup"
   }
 
   // ---- processes -----------------------------------------------------------
@@ -148,8 +146,7 @@ Item {
         running = true
       } else {
         // Natural exit (mpv window closed, or manual stop) — status back
-        // to the channel count. updateStatus is a no-op while playing,
-        // so a queued switch can't clobber the new title.
+        // to the channel count.
         root.updateStatus()
       }
     }
@@ -189,8 +186,14 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { root.epgNow = JSON.parse(text || "[]") } catch (e) { root.epgNow = [] }
-        root.updateStatus()
+        var list = []
+        try { list = JSON.parse(text || "[]") } catch (e) { list = [] }
+        var map = ({})
+        for (var i = 0; i < list.length; i++)
+          map[String(list[i].channel_id)] = { now: list[i].now || "", next: list[i].next || "" }
+        root.epgNow = list
+        root.epgMap = map
+        root.epgLoaded = true
       }
     }
   }
@@ -200,12 +203,27 @@ Item {
     running: false
     command: [root.helperPath(), "--sync"]
     stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: syncErr; waitForEnd: true }
     onExited: function(code) {
       root.syncing = false
-      root.statusLine = code === 0 ? "Synced" : "Sync failed — see Setup"
+      if (code === 0) {
+        root.statusLine = "Synced"
+      } else {
+        // iptv-sync redacts secrets before printing, so the last stderr
+        // line is safe to show in the Setup tab.
+        var lines = String(syncErr.text || "").trim().split("\n")
+        root.lastError = lines.length ? lines[lines.length - 1] : ("exit " + code)
+        root.statusLine = "Sync failed — see Setup"
+      }
       root.loadAll()
     }
+  }
+
+  Timer {
+    interval: root.epgRefreshMs
+    running: true
+    repeat: true
+    onTriggered: root.refreshEpg()
   }
 
   FileView {

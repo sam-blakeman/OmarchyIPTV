@@ -2,11 +2,15 @@
   "schemaVersion": 1,
   "id": "user.iptv",
   "name": "IPTV",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "sam-blakeman",
   "license": "MIT",
   "description": "Lightweight single-provider IPTV browser (m3u / Xtream, Live + VOD, XMLTV EPG, favorites, fullscreen TV mode). Themed via shell tokens; playback in external mpv.",
-  "kinds": ["bar-widget", "overlay", "service"],
+  "kinds": [
+    "bar-widget",
+    "overlay",
+    "service"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "barWidget": "BarWidget.qml",

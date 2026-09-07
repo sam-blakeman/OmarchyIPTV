@@ -23,4 +23,17 @@ if ! command -v mpv >/dev/null 2>&1; then
   exit 127
 fi
 
-exec mpv --title="omarchy-iptv: $TITLE" --force-window=yes --keep-open=no "$URL"
+# Providers that whitelist a User-Agent need mpv to send the same one the
+# sync used. Optional "user_agent" key in provider.json.
+EXTRA=()
+CONF="$HOME/.config/omarchy-iptv/provider.json"
+if [[ -r $CONF ]]; then
+  UA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("user_agent") or "")' "$CONF" 2>/dev/null)
+  [[ -n $UA ]] && EXTRA+=(--user-agent="$UA")
+fi
+
+# --force-media-title keeps the URL (which carries the password for Xtream)
+# out of mpv's OSD and title; --ytdl=no skips the yt-dlp probe on every
+# stream URL.
+exec mpv --title="omarchy-iptv: $TITLE" --force-media-title="$TITLE" \
+  --force-window=yes --keep-open=no --ytdl=no "${EXTRA[@]}" "$URL"

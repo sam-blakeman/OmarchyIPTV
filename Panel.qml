@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "IptvModel.js" as Model
@@ -28,6 +27,7 @@ Panel {
   readonly property var vod: service ? service.vod : []
   readonly property var epgNow: service ? service.epgNow : []
   readonly property string statusLine: service ? service.statusLine : "IPTV"
+  readonly property string lastError: service ? service.lastError : ""
   readonly property bool syncing: service ? service.syncing === true : false
 
   readonly property string favGroup: "★ Favorites"
@@ -39,6 +39,11 @@ Panel {
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
+
+  // Live and VOD have different group sets; don't carry a group that no
+  // longer exists across a tab switch.
+  onTabChanged: if (root.groupList.indexOf(root.group) === -1) root.group = "All"
+  onGroupChanged: groupPicker.value = root.group
 
   function open() { root.controller.show() }
   function close() { root.controller.hide() }
@@ -66,6 +71,12 @@ Panel {
   function isFav(kind, id) {
     return service && service.isFav ? service.isFav(kind, id) : false
   }
+  function nowFor(item) {
+    return service && service.epgText ? service.epgText(item) : (item && item.epg_now ? item.epg_now : "")
+  }
+  function nextFor(item) {
+    return service && service.epgNextText ? service.epgNextText(item) : (item && item.epg_next ? item.epg_next : "")
+  }
   function openOverlay() {
     if (hostWidget && hostWidget.openOverlay) hostWidget.openOverlay()
   }
@@ -87,6 +98,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
+        id: content
         anchors.fill: parent
         anchors.margins: Style.space(12)
         spacing: Style.space(8)
@@ -160,12 +172,14 @@ Panel {
           }
         }
 
-        // Group filter (live/vod)
+        // Group filter (live/vod). Playlists routinely have 50-100 groups,
+        // so a searchable picker instead of a row of the first few.
         Row {
           visible: root.tab === "live" || root.tab === "vod"
           width: parent.width
-          spacing: Style.space(4)
+          spacing: Style.space(8)
           Text {
+            id: groupLabel
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
             text: "Group:"
@@ -173,16 +187,15 @@ Panel {
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
           }
-          Repeater {
-            model: root.groupList.slice(0, 8)
-            Button {
-              required property string modelData
-              text: modelData.length > 14 ? modelData.slice(0, 13) + "…" : modelData
-              tooltipText: modelData
-              selected: root.group === modelData
-              fontFamily: root.contentFontFamily
-              onClicked: root.group = modelData
-            }
+          SearchableDropdown {
+            id: groupPicker
+            width: parent.width - groupLabel.width - Style.space(8)
+            showLabel: false
+            placeholderText: "Search groups…"
+            fontFamily: root.contentFontFamily
+            options: root.groupList
+            Component.onCompleted: value = root.group
+            onChanged: function(v) { root.group = v }
           }
         }
 
@@ -190,7 +203,7 @@ Panel {
         ListView {
           visible: root.tab === "live"
           width: parent.width
-          height: Style.space(330)
+          height: parent.height - y
           clip: true
           model: root.visibleChannels
           delegate: channelDelegate
@@ -200,7 +213,7 @@ Panel {
         ListView {
           visible: root.tab === "vod"
           width: parent.width
-          height: Style.space(330)
+          height: parent.height - y
           clip: true
           model: root.visibleVod
           delegate: vodDelegate
@@ -210,7 +223,7 @@ Panel {
         ListView {
           visible: root.tab === "epg"
           width: parent.width
-          height: Style.space(330)
+          height: parent.height - y
           clip: true
           model: root.epgNow
           delegate: epgDelegate
@@ -222,10 +235,20 @@ Panel {
           width: parent.width
           spacing: Style.space(6)
           Text {
+            visible: root.lastError !== ""
             width: parent.width
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
-            text: "Single provider. Edit ~/.config/omarchy-iptv/provider.json then press 󰑓.\n\nm3u: {\"type\":\"m3u\",\"url\":\"…m3u\",\"epg\":\"…xmltv\"}\nxtream: {\"type\":\"xtream\",\"host\":\"http://h:8080\",\"username\":\"u\"} + secret-tool store --label iptv application user.iptv username <user>"
+            text: "Last sync failed: " + root.lastError
+            color: Color.accent
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: "Single provider. Edit ~/.config/omarchy-iptv/provider.json then press 󰑓.\n\nm3u: {\"type\":\"m3u\",\"url\":\"…m3u\",\"epg\":\"…xmltv\"}\nxtream: {\"type\":\"xtream\",\"host\":\"http://h:8080\",\"username\":\"u\"} + secret-tool store --label omarchy-iptv application user.iptv username <user>\n\nOptional \"user_agent\" key if the provider whitelists one."
             color: root.contentForeground
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.bodySmall
@@ -267,7 +290,7 @@ Panel {
           width: parent.width - Style.space(150)
           elide: Text.ElideRight
           textFormat: Text.PlainText
-          text: modelData.name + (modelData.epg_now ? " — " + modelData.epg_now : "")
+          text: modelData.name + (root.nowFor(modelData) ? " — " + root.nowFor(modelData) : "")
           color: modelData.available === false ? Color.muted : root.contentForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.body
@@ -277,7 +300,7 @@ Panel {
           width: Style.space(110)
           elide: Text.ElideRight
           textFormat: Text.PlainText
-          text: modelData.epg_next ? "▸ " + modelData.epg_next : ""
+          text: root.nextFor(modelData) ? "▸ " + root.nextFor(modelData) : ""
           color: Color.muted
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption

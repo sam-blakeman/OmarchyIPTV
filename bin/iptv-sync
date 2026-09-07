@@ -9,17 +9,22 @@ Reads  ~/.config/omarchy-iptv/provider.json  (one provider):
            "username": "user"}                        # password via
            # secret-tool / $IPTV_PASSWORD / "password" key (last resort)
 
+  Optional for both: "user_agent": "..."  (some providers whitelist UAs)
+
 Cache lives in ~/.cache/omarchy-iptv/: channels.json, vod.json, epg.db.
 Only now-2h..now+24h of EPG is kept, so the shell never holds a week
 of listings in memory.
 
 NOTE: stream URLs for Xtream embed the password (required by the
 protocol). They are written to mode-600 cache files and emitted on
---dump-* for the QML player only — never log them.
+--dump-* for the QML player only. Error output is passed through
+redact() so a password can never reach the shell log.
 """
 
 import argparse
 import gzip
+import hashlib
+import io
 import json
 import os
 import re
@@ -27,16 +32,41 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 
-CONFIG = os.path.expanduser("~/.config/omarchy-iptv/provider.json")
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy-iptv")
+CONFIG = os.path.join(CONFIG_DIR, "provider.json")
 CACHE = os.path.expanduser("~/.cache/omarchy-iptv")
 CHANNELS_JSON = os.path.join(CACHE, "channels.json")
 VOD_JSON = os.path.join(CACHE, "vod.json")
 EPG_DB = os.path.join(CACHE, "epg.db")
-TIMEOUT = 25
+TIMEOUT = 60
+DEFAULT_UA = "omarchy-iptv/0.1"
+
+# Strings that must never appear in stderr (filled in by sync_xtream).
+SECRETS = []
+
+
+def redact(text):
+    text = str(text)
+    for s in SECRETS:
+        if s:
+            text = text.replace(s, "***")
+            text = text.replace(urllib.parse.quote(s, safe=""), "***")
+    return text
+
+
+def warn(msg):
+    print(redact(msg), file=sys.stderr)
+
+
+def die(msg, code=1):
+    warn(msg)
+    sys.exit(code)
 
 
 # --- config / secrets -------------------------------------------------------
@@ -48,11 +78,11 @@ def load_provider():
     except FileNotFoundError:
         return None
     except json.JSONDecodeError as e:
-        print(f"bad {CONFIG}: {e}", file=sys.stderr)
-        sys.exit(1)
+        die(f"bad {CONFIG}: {e}")
 
 
-def get_password(username):
+def get_password(prov):
+    username = prov["username"]
     if os.environ.get("IPTV_PASSWORD"):
         return os.environ["IPTV_PASSWORD"]
     try:
@@ -64,98 +94,109 @@ def get_password(username):
             return p.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    prov = load_provider() or {}
     if prov.get("password"):
+        mode = os.stat(CONFIG).st_mode & 0o777
+        if mode & 0o077:
+            warn(f"warning: {CONFIG} holds a password but is mode {mode:o}; "
+                 "chmod 600 it")
         return prov["password"]
     return None
 
 
 # --- http -------------------------------------------------------------------
 
-def fetch(url, username=None, password=None):
+def fetch(url, user_agent=None):
     req = urllib.request.Request(
-        url, headers={"User-Agent": "omarchy-iptv/0.1",
+        url, headers={"User-Agent": user_agent or DEFAULT_UA,
                       "Accept-Encoding": "gzip"})
-    if username is not None and password is not None:
-        import base64
-        token = base64.b64encode(f"{username}:{password}".encode()).decode()
-        req.add_header("Authorization", f"Basic {token}")
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         data = r.read()
-        if r.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
-        elif data[:2] == b"\x1f\x8b":
-            data = gzip.decompress(data)
-        return data
+    if r.headers.get("Content-Encoding") == "gzip" or data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    return data
 
 
-def fetch_json(url):
-    return json.loads(fetch(url).decode("utf-8", "replace"))
+def fetch_json(url, user_agent=None):
+    return json.loads(fetch(url, user_agent).decode("utf-8", "replace"))
 
 
 # --- m3u --------------------------------------------------------------------
 
-EXTINF_RE = re.compile(r'#EXTINF:[^\n]*?,\s*(?P<name>[^\n]*)', re.IGNORECASE)
-ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+ATTR_RE = re.compile(r'([\w.-]+)="([^"]*)"')
+
+
+def split_extinf(line):
+    """Return (attrs_text, name) for an #EXTINF line.
+
+    The name starts after the first comma that is outside double quotes,
+    so `group-title="UK, News",BBC One` and `#EXTINF:0,Name, With Comma`
+    both come out right.
+    """
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "," and not in_quote:
+            return line[:i], line[i + 1:].strip()
+    return line, ""
+
+
+def stable_id(url, name, group):
+    # Same row => same id across re-syncs regardless of playlist order, so
+    # favorites survive; two streams sharing one tvg-id (HD/SD variants) or
+    # one URL listed under two groups stay distinct.
+    key = f"{url}\n{name}\n{group}".encode("utf-8", "replace")
+    return "m3u-" + hashlib.sha1(key).hexdigest()[:12]
 
 
 def parse_m3u(text):
     channels = []
-    current = {}
+    current = None
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         if line.upper().startswith("#EXTINF"):
-            attrs = dict(ATTR_RE.findall(line))
-            m = EXTINF_RE.search(line)
+            head, name = split_extinf(line)
+            attrs = dict(ATTR_RE.findall(head))
             current = {
                 "tvg_id": attrs.get("tvg-id", ""),
                 "logo": attrs.get("tvg-logo", ""),
-                "group": attrs.get("group-title", "Ungrouped") or "Ungrouped",
-                "name": (m.group("name").strip() if m and m.group("name").strip()
-                         else attrs.get("tvg-name", "Unknown")),
+                "group": attrs.get("group-title") or "Ungrouped",
+                "name": name or attrs.get("tvg-name") or "Unknown",
             }
         elif line.startswith("#"):
-            continue
-        else:  # stream URL
-            if current:
-                current["url"] = line
-                current.setdefault("tvg_id", "")
-                current.setdefault("logo", "")
-                current.setdefault("group", "Ungrouped")
-                channels.append(current)
-                current = {}
-    for i, c in enumerate(channels):
-        c["id"] = c.get("tvg_id") or f"m3u-{i}"
+            continue  # #EXTVLCOPT, #KODIPROP, #EXTGRP, ...
+        elif current is not None:
+            current["url"] = line
+            current["id"] = stable_id(line, current["name"], current["group"])
+            channels.append(current)
+            current = None
     return channels
 
 
 # --- xmltv ------------------------------------------------------------------
 
+XMLTV_TIME_RE = re.compile(r"(\d{14})(?:\s+([+-])(\d{2})(\d{2}))?")
+
+
 def parse_xmltv_time(s):
-    # "20260907120000 +0200" (offset optional)
-    s = s.strip()
-    m = re.match(r"(\d{14})(?:\s+([+-]\d{4}))?", s)
+    # "20260907120000 +0200" (offset optional, defaults to UTC)
+    m = XMLTV_TIME_RE.match((s or "").strip())
     if not m:
         return None
     dt = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+    tz = timezone.utc
     if m.group(2):
-        from datetime import timedelta
-        off = m.group(2)
-        delta = int(off[1:3]) * 60 + int(off[3:5])
-        if off[0] == "-":
-            delta = -delta
-        tz = timezone(timedelta(minutes=delta))
-        dt = dt.replace(tzinfo=tz)
-    else:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+        minutes = int(m.group(3)) * 60 + int(m.group(4))
+        tz = timezone(timedelta(minutes=-minutes if m.group(2) == "-" else minutes))
+    return int(dt.replace(tzinfo=tz).timestamp())
 
 
 def epg_db():
     os.makedirs(CACHE, exist_ok=True)
     db = sqlite3.connect(EPG_DB)
+    os.chmod(EPG_DB, 0o600)
     db.execute("""CREATE TABLE IF NOT EXISTS programmes
                   (channel TEXT, start INTEGER, end INTEGER,
                    title TEXT, desc TEXT)""")
@@ -165,122 +206,137 @@ def epg_db():
     return db
 
 
+def _text(elem, tag):
+    child = elem.find(tag)
+    return child.text.strip() if child is not None and child.text else ""
+
+
 def import_xmltv(xml_bytes):
+    """Stream-parse XMLTV so a week-long, multi-MB guide never sits in
+    memory as a DOM; only the now-2h..now+24h rows are kept."""
     now = int(time.time())
     keep_from, keep_to = now - 2 * 3600, now + 24 * 3600
-    root = ET.fromstring(xml_bytes)
     names = {}
-    for ch in root.findall("channel"):
-        cid = ch.get("id", "")
-        dn = ch.find("display-name")
-        if cid and dn is not None and dn.text:
-            names[cid] = dn.text.strip()
     rows = []
-    for p in root.findall("programme"):
-        start = parse_xmltv_time(p.get("start", ""))
-        end = parse_xmltv_time(p.get("stop", ""))
-        if not start or not end:
-            continue
-        if end < keep_from or start > keep_to:
-            continue
-        title = p.find("title")
-        desc = p.find("desc")
-        rows.append((p.get("channel", ""), start, end,
-                     title.text.strip() if title is not None and title.text else "",
-                     desc.text.strip()[:500] if desc is not None and desc.text else ""))
+    for _event, el in ET.iterparse(io.BytesIO(xml_bytes), events=("end",)):
+        if el.tag == "channel":
+            cid = el.get("id", "")
+            dn = _text(el, "display-name")
+            if cid and dn:
+                names[cid] = dn
+            el.clear()
+        elif el.tag == "programme":
+            start = parse_xmltv_time(el.get("start"))
+            end = parse_xmltv_time(el.get("stop"))
+            if start and end and end >= keep_from and start <= keep_to:
+                rows.append((el.get("channel", ""), start, end,
+                             _text(el, "title"), _text(el, "desc")[:500]))
+            el.clear()
     db = epg_db()
-    db.execute("DELETE FROM programmes")
-    db.executemany("INSERT INTO programmes VALUES (?,?,?,?,?)", rows)
-    db.execute("DELETE FROM channels")
-    db.executemany("INSERT OR REPLACE INTO channels VALUES (?,?)", list(names.items()))
-    db.commit()
-    kept = db.execute("SELECT COUNT(*) FROM programmes").fetchone()[0]
+    with db:
+        db.execute("DELETE FROM programmes")
+        db.executemany("INSERT INTO programmes VALUES (?,?,?,?,?)", rows)
+        db.execute("DELETE FROM channels")
+        db.executemany("INSERT OR REPLACE INTO channels VALUES (?,?)", list(names.items()))
     db.close()
-    return kept
+    return len(rows)
 
 
 def epg_window():
     """All programmes overlapping now..now+6h, keyed by channel."""
     now = int(time.time())
-    try:
-        db = sqlite3.connect(EPG_DB)
-    except sqlite3.Error:
+    if not os.path.exists(EPG_DB):  # never create an empty db from a dump
         return now, {}
     try:
-        rows = db.execute(
-            "SELECT channel, start, end, title FROM programmes "
-            "WHERE end > ? AND start < ? ORDER BY start",
-            (now, now + 6 * 3600)).fetchall()
+        db = sqlite3.connect(f"file:{EPG_DB}?mode=ro", uri=True)
+        try:
+            rows = db.execute(
+                "SELECT channel, start, end, title FROM programmes "
+                "WHERE end > ? AND start < ? ORDER BY start",
+                (now, now + 6 * 3600)).fetchall()
+        finally:
+            db.close()
     except sqlite3.Error:
         return now, {}
-    finally:
-        db.close()
     by_ch = {}
     for cid, s, e, t in rows:
-        by_ch.setdefault(cid, []).append(
-            {"start": s, "end": e, "title": t or ""})
+        by_ch.setdefault(cid, []).append({"start": s, "end": e, "title": t or ""})
     return now, by_ch
+
+
+def now_next(progs, now):
+    cur = nxt = ""
+    for p in progs:
+        if p["start"] <= now < p["end"]:
+            cur = p["title"]
+        elif p["start"] > now and not nxt:
+            nxt = p["title"]
+    return cur, nxt
 
 
 # --- sync -------------------------------------------------------------------
 
 def sync_m3u(prov):
-    channels = parse_m3u(fetch(prov["url"]).decode("utf-8", "replace"))
+    ua = prov.get("user_agent")
+    channels = parse_m3u(fetch(prov["url"], ua).decode("utf-8", "replace"))
+    if not channels:
+        die("playlist fetched but no channels parsed; is the url an m3u?")
     save_json(CHANNELS_JSON, channels)
     save_json(VOD_JSON, [])  # m3u has no VOD split in v1
     kept = 0
-    epg_url = prov.get("epg")
-    if epg_url:
+    if prov.get("epg"):
         try:
-            kept = import_xmltv(fetch(epg_url))
+            kept = import_xmltv(fetch(prov["epg"], ua))
         except Exception as e:
-            print(f"warning: EPG fetch failed ({e}); continuing without EPG",
-                  file=sys.stderr)
+            warn(f"warning: EPG fetch failed ({e}); continuing without EPG")
     return len(channels), 0, kept
 
 
 def sync_xtream(prov):
     host = prov["host"].rstrip("/")
     user = prov["username"]
-    pw = get_password(user)
+    ua = prov.get("user_agent")
+    pw = get_password(prov)
     if not pw:
-        print("xtream password missing: secret-tool store --label iptv "
-              "application user.iptv username " + user
-              + "  (or $IPTV_PASSWORD)", file=sys.stderr)
-        sys.exit(1)
-    base = f"{host}/player_api.php?username={user}&password={pw}"
-    live_cats = {c["category_id"]: c["category_name"]
-                 for c in fetch_json(base + "&action=get_live_categories")}
-    vod_cats = {c["category_id"]: c["category_name"]
-                for c in fetch_json(base + "&action=get_vod_categories")}
-    live = fetch_json(base + "&action=get_live_streams")
-    vod = fetch_json(base + "&action=get_vod_streams")
+        die("xtream password missing: secret-tool store --label omarchy-iptv "
+            f"application user.iptv username {user}  (or $IPTV_PASSWORD)")
+    SECRETS.append(pw)
+    q_user, q_pw = urllib.parse.quote(user, safe=""), urllib.parse.quote(pw, safe="")
+    api = f"{host}/player_api.php?username={q_user}&password={q_pw}"
+
+    def cats(action):
+        return {str(c.get("category_id")): c.get("category_name") or "Ungrouped"
+                for c in fetch_json(f"{api}&action={action}", ua)}
+
+    live_cats = cats("get_live_categories")
+    vod_cats = cats("get_vod_categories")
+    live = fetch_json(f"{api}&action=get_live_streams", ua)
+    vod = fetch_json(f"{api}&action=get_vod_streams", ua)
 
     channels = [{
         "id": f"xc-{s.get('stream_id')}",
-        "name": s.get("name", f"ch {s.get('stream_id')}"),
-        "logo": s.get("stream_icon", ""),
-        "group": live_cats.get(s.get("category_id"), "Ungrouped"),
-        "url": f"{host}/live/{user}/{pw}/{s.get('stream_id')}.m3u8",
-        "tvg_id": s.get("epg_channel_id", "") or "",
+        "name": s.get("name") or f"ch {s.get('stream_id')}",
+        "logo": s.get("stream_icon") or "",
+        "group": live_cats.get(str(s.get("category_id")), "Ungrouped"),
+        "url": f"{host}/live/{q_user}/{q_pw}/{s.get('stream_id')}.m3u8",
+        "tvg_id": s.get("epg_channel_id") or "",
     } for s in live]
     items = [{
         "id": f"xcv-{s.get('stream_id')}",
-        "name": s.get("name", f"vod {s.get('stream_id')}"),
-        "logo": s.get("stream_icon", ""),
-        "group": vod_cats.get(s.get("category_id"), "Ungrouped"),
-        "url": (f"{host}/movie/{user}/{pw}/{s.get('stream_id')}."
-                f"{s.get('container_extension', 'mp4')}"),
+        "name": s.get("name") or f"vod {s.get('stream_id')}",
+        "logo": s.get("stream_icon") or "",
+        "group": vod_cats.get(str(s.get("category_id")), "Ungrouped"),
+        "url": (f"{host}/movie/{q_user}/{q_pw}/{s.get('stream_id')}."
+                f"{s.get('container_extension') or 'mp4'}"),
         "tvg_id": "",
     } for s in vod]
     save_json(CHANNELS_JSON, channels)
     save_json(VOD_JSON, items)
 
     try:  # full EPG file first, per API docs
-        kept = import_xmltv(
-            fetch(f"{host}/xmltv.php?username={user}&password={pw}"))
+        kept = import_xmltv(fetch(f"{host}/xmltv.php?username={q_user}&password={q_pw}", ua))
     except Exception as e:
-        print(f"xmltv.php failed ({e}); EPG will be sparse", file=sys.stderr)
+        warn(f"warning: xmltv.php failed ({e}); EPG will be sparse")
         kept = 0
     return len(channels), len(items), kept
 
@@ -288,9 +344,9 @@ def sync_xtream(prov):
 def save_json(path, obj):
     os.makedirs(CACHE, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    # Created 0600 from the start: no window where the file is world-readable.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(obj, f)
-    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -309,13 +365,7 @@ def dump_channels():
     now, by_ch = epg_window()
     out = []
     for c in channels:
-        progs = by_ch.get(c.get("tvg_id", ""), []) or by_ch.get(c.get("id", ""), [])
-        cur = nxt = ""
-        for p in progs:
-            if p["start"] <= now < p["end"]:
-                cur = p["title"]
-            elif p["start"] > now and not nxt:
-                nxt = p["title"]
+        cur, nxt = now_next(by_ch.get(c.get("tvg_id") or "", []), now)
         out.append({**c, "epg_now": cur, "epg_next": nxt})
     json.dump(out, sys.stdout)
 
@@ -325,25 +375,19 @@ def dump_vod():
 
 
 def dump_epg_now():
+    """Now/next for every channel that has guide data, keyed by channel id.
+    Cheap enough for the shell to re-run every few minutes."""
     channels = load_json(CHANNELS_JSON)
     now, by_ch = epg_window()
     out = []
     for c in channels:
-        key = c.get("tvg_id") or c.get("id")
-        progs = by_ch.get(key, [])
+        progs = by_ch.get(c.get("tvg_id") or "")
         if not progs:
             continue
-        cur = nxt = ""
-        for p in progs:
-            if p["start"] <= now < p["end"]:
-                cur = p["title"]
-            elif p["start"] > now and not nxt:
-                nxt = p["title"]
+        cur, nxt = now_next(progs, now)
         if cur or nxt:
             out.append({"channel_id": c.get("id"), "name": c.get("name"),
                         "now": cur, "next": nxt})
-        if len(out) >= 500:
-            break
     json.dump(out, sys.stdout)
 
 
@@ -356,6 +400,9 @@ def main():
     g.add_argument("--dump-epg-now", action="store_true")
     a = ap.parse_args()
 
+    # So the shell's favorites.json write never fails on a fresh install.
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
     if a.dump_channels:
         dump_channels()
     elif a.dump_vod:
@@ -365,16 +412,23 @@ def main():
     else:
         prov = load_provider()
         if not prov:
-            print(f"no provider: create {CONFIG} (see README)", file=sys.stderr)
-            sys.exit(1)
+            die(f"no provider: create {CONFIG} (see README)")
         t = prov.get("type")
-        if t == "m3u":
-            nc, nv, ne = sync_m3u(prov)
-        elif t == "xtream":
-            nc, nv, ne = sync_xtream(prov)
-        else:
-            print("provider type must be 'm3u' or 'xtream'", file=sys.stderr)
-            sys.exit(1)
+        try:
+            if t == "m3u":
+                nc, nv, ne = sync_m3u(prov)
+            elif t == "xtream":
+                nc, nv, ne = sync_xtream(prov)
+            else:
+                die("provider type must be 'm3u' or 'xtream'")
+        except KeyError as e:
+            die(f"provider.json missing key {e}")
+        except urllib.error.HTTPError as e:
+            die(f"provider returned HTTP {e.code} {e.reason}")
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            die(f"network error: {getattr(e, 'reason', e)}")
+        except (ValueError, ET.ParseError) as e:
+            die(f"bad provider response: {e}")
         print(f"synced: {nc} live, {nv} vod, {ne} epg programmes")
 
 
