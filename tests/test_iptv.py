@@ -43,6 +43,16 @@ class SlimAndMatch(unittest.TestCase):
         self.assertFalse(sync.row_matches(row, "bbc", "US"))
         self.assertFalse(sync.row_matches(row, "itv", "UK"))
 
+    def test_query_matches_group_when_not_narrowed(self):
+        row = {"name": "BBC One", "group": "News"}
+        # a category name is a shortcut while the picker is still on All
+        self.assertTrue(sync.row_matches(row, "news", "All"))
+        self.assertTrue(sync.row_matches(row, "news", ""))
+        # ...but not once that group is picked, or every row in it would match
+        self.assertFalse(sync.row_matches({"name": "ITV", "group": "News"}, "news", "News"))
+        # an unrelated query still misses
+        self.assertFalse(sync.row_matches(row, "sports", "All"))
+
     def test_group_names(self):
         rows = [{"group": "UK"}, {"group": "UK"}, {"group": "US"}]
         self.assertEqual(sync.group_names(rows), ["All", "UK", "US"])
