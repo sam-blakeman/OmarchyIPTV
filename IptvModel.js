@@ -1,9 +1,13 @@
 function filterChannels(channels, query, group) {
   var q = String(query || "").toLowerCase();
+  // A category name is a search shortcut only while no group is picked; inside
+  // a group every row would trivially match its own group name.
+  var wide = !group || group === "All";
   return (channels || []).filter(function (c) {
-    if (group && group !== "All" && c.group !== group) return false;
+    if (!wide && c.group !== group) return false;
     if (!q) return true;
-    return String(c.name || "").toLowerCase().indexOf(q) !== -1;
+    if (String(c.name || "").toLowerCase().indexOf(q) !== -1) return true;
+    return wide && String(c.group || "Ungrouped").toLowerCase().indexOf(q) !== -1;
   });
 }
 

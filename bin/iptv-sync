@@ -566,12 +566,16 @@ def slim(row):
 
 
 def row_matches(row, query, group):
-    if group and group != "All" and (row.get("group") or "Ungrouped") != group:
+    narrowed = bool(group) and group != "All"
+    if narrowed and (row.get("group") or "Ungrouped") != group:
         return False
     if query:
-        name = (row.get("name") or "").lower()
-        if query.lower() not in name:
-            return False
+        q = query.lower()
+        if q in (row.get("name") or "").lower():
+            return True
+        # A category name is a search shortcut only while no group is picked;
+        # inside a group every row would trivially match its own group name.
+        return not narrowed and q in (row.get("group") or "Ungrouped").lower()
     return True
 
 
