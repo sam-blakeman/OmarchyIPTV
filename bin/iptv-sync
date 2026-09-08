@@ -22,7 +22,6 @@ passed through redact() so a password can never reach the shell log.
 """
 
 import argparse
-import gzip
 import hashlib
 import io
 import json
@@ -35,6 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 
@@ -173,19 +173,123 @@ def write_provider(args):
 
 # --- http -------------------------------------------------------------------
 
-def fetch(url, user_agent=None):
+MIB = 1024 * 1024
+CHUNK = 256 * 1024
+GZIP_MAGIC = b"\x1f\x8b"
+
+# Hard caps on what a provider may send, so a broken, compromised or hostile
+# server (or a gzip bomb) cannot exhaust memory during sync. Per kind:
+# (bytes on the wire, bytes after gzip expansion). M3U and Xtream JSON are
+# held in memory whole, so their caps are tight. XMLTV is stream-parsed
+# into sqlite (see import_xmltv), so its expanded cap bounds work, not
+# memory. Documented in README "Limits".
+LIMITS = {
+    "m3u": (32 * MIB, 128 * MIB),
+    "json": (32 * MIB, 128 * MIB),
+    "xmltv": (256 * MIB, 2048 * MIB),
+}
+
+
+class ResponseTooLarge(Exception):
+    pass
+
+
+class BoundedReader:
+    """File-like view of an HTTP body: counts compressed bytes, inflates
+    gzip incrementally, and raises ResponseTooLarge the moment either cap
+    is crossed. Never buffers more than about one CHUNK of look-ahead, so
+    a caller that streams (ET.iterparse) holds no more than that."""
+
+    def __init__(self, raw, max_compressed, max_expanded, kind="provider"):
+        self.raw = raw
+        self.max_compressed = max_compressed
+        self.max_expanded = max_expanded
+        self.kind = kind
+        self.n_in = self.n_out = 0
+        self._gz = None  # unknown until the first bytes are sniffed
+        self._dec = None
+        self._buf = b""
+        self._eof = False
+
+    def _too_large(self, what, cap):
+        raise ResponseTooLarge(
+            f"{self.kind} response exceeded the {cap // MIB} MiB {what} limit")
+
+    def _pull(self):
+        """Next expanded chunk, or b"" once the body is exhausted. May also
+        return b"" before EOF when the inflater wants more input."""
+        if self._dec is not None and self._dec.unconsumed_tail:
+            out = self._dec.decompress(self._dec.unconsumed_tail, CHUNK)
+        else:
+            chunk = self.raw.read(CHUNK)
+            while self._gz is None and chunk and len(chunk) < 2:
+                more = self.raw.read(CHUNK)  # need 2 bytes to sniff gzip
+                if not more:
+                    break
+                chunk += more
+            if not chunk:
+                self._eof = True
+                if self._dec is not None and not self._dec.eof:
+                    raise ValueError("truncated gzip response")
+                return b""
+            self.n_in += len(chunk)
+            if self.n_in > self.max_compressed:
+                self._too_large("download", self.max_compressed)
+            if self._gz is None:
+                self._gz = chunk[:2] == GZIP_MAGIC
+                if self._gz:
+                    self._dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out = self._dec.decompress(chunk, CHUNK) if self._gz else chunk
+        self.n_out += len(out)
+        if self.n_out > self.max_expanded:
+            self._too_large("expanded", self.max_expanded)
+        return out
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            parts = [self._buf]
+            self._buf = b""
+            while not self._eof:
+                parts.append(self._pull())
+            return b"".join(parts)
+        while len(self._buf) < n and not self._eof:
+            self._buf += self._pull()
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+
+def _open(url, user_agent, kind):
+    max_c, max_e = LIMITS[kind]
     req = urllib.request.Request(
         url, headers={"User-Agent": user_agent or DEFAULT_UA,
                       "Accept-Encoding": "gzip"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        data = r.read()
-    if r.headers.get("Content-Encoding") == "gzip" or data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
-    return data
+    r = urllib.request.urlopen(req, timeout=TIMEOUT)
+    length = r.headers.get("Content-Length") or ""
+    if length.isdigit() and int(length) > max_c:
+        r.close()
+        raise ResponseTooLarge(
+            f"{kind} response advertises {int(length) // MIB} MiB, over the "
+            f"{max_c // MIB} MiB download limit")
+    return r, BoundedReader(r, max_c, max_e, kind)
+
+
+def fetch(url, user_agent=None, kind="m3u"):
+    """Whole body as bytes, gzip expanded, within LIMITS[kind]."""
+    r, body = _open(url, user_agent, kind)
+    with r:
+        return body.read()
 
 
 def fetch_json(url, user_agent=None):
-    return json.loads(fetch(url, user_agent).decode("utf-8", "replace"))
+    return json.loads(fetch(url, user_agent, "json").decode("utf-8", "replace"))
+
+
+def fetch_xmltv(url, user_agent=None):
+    """Stream the guide from the socket straight into sqlite; the file is
+    never held in memory whole."""
+    r, body = _open(url, user_agent, "xmltv")
+    with r:
+        return import_xmltv(body)
 
 
 # --- m3u --------------------------------------------------------------------
@@ -279,35 +383,59 @@ def _text(elem, tag):
     return child.text.strip() if child is not None and child.text else ""
 
 
-def import_xmltv(xml_bytes):
-    """Stream-parse XMLTV so a week-long, multi-MB guide never sits in
-    memory as a DOM; only the now-2h..now+24h rows are kept."""
+def import_xmltv(source):
+    """Stream-parse XMLTV (bytes or a file-like reader) straight into
+    sqlite. Nothing proportional to the guide's size stays in memory:
+    handled <channel>/<programme> elements are dropped from the tree as
+    they complete, rows go to the db in batches, and only now-2h..now+24h
+    programmes are kept. Runs in one transaction, so a bad or oversized
+    guide leaves the previous EPG intact."""
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)
     now = int(time.time())
     keep_from, keep_to = now - 2 * 3600, now + 24 * 3600
-    names = {}
-    rows = []
-    for _event, el in ET.iterparse(io.BytesIO(xml_bytes), events=("end",)):
-        if el.tag == "channel":
-            cid = el.get("id", "")
-            dn = _text(el, "display-name")
-            if cid and dn:
-                names[cid] = dn
-            el.clear()
-        elif el.tag == "programme":
-            start = parse_xmltv_time(el.get("start"))
-            end = parse_xmltv_time(el.get("stop"))
-            if start and end and end >= keep_from and start <= keep_to:
-                rows.append((el.get("channel", ""), start, end,
-                             _text(el, "title"), _text(el, "desc")[:500]))
-            el.clear()
+    kept = 0
+    rows, names, root = [], [], None
     db = epg_db()
-    with db:
-        db.execute("DELETE FROM programmes")
-        db.executemany("INSERT INTO programmes VALUES (?,?,?,?,?)", rows)
-        db.execute("DELETE FROM channels")
-        db.executemany("INSERT OR REPLACE INTO channels VALUES (?,?)", list(names.items()))
-    db.close()
-    return len(rows)
+
+    def flush():
+        if rows:
+            db.executemany("INSERT INTO programmes VALUES (?,?,?,?,?)", rows)
+            rows.clear()
+        if names:
+            db.executemany("INSERT OR REPLACE INTO channels VALUES (?,?)", names)
+            names.clear()
+
+    try:
+        with db:
+            db.execute("DELETE FROM programmes")
+            db.execute("DELETE FROM channels")
+            for event, el in ET.iterparse(source, events=("start", "end")):
+                if event == "start":
+                    if root is None:
+                        root = el
+                    continue
+                if el.tag == "channel":
+                    cid = el.get("id", "")
+                    dn = _text(el, "display-name")
+                    if cid and dn:
+                        names.append((cid, dn))
+                elif el.tag == "programme":
+                    start = parse_xmltv_time(el.get("start"))
+                    end = parse_xmltv_time(el.get("stop"))
+                    if start and end and end >= keep_from and start <= keep_to:
+                        rows.append((el.get("channel", ""), start, end,
+                                     _text(el, "title"), _text(el, "desc")[:500]))
+                        kept += 1
+                else:
+                    continue  # <title>, <desc>...: wait for the parent to end
+                root.clear()  # forget the finished element and its siblings
+                if len(rows) + len(names) >= 5000:
+                    flush()
+            flush()
+    finally:
+        db.close()
+    return kept
 
 
 def epg_window():
@@ -354,7 +482,7 @@ def sync_m3u(prov):
     kept = 0
     if prov.get("epg"):
         try:
-            kept = import_xmltv(fetch(prov["epg"], ua))
+            kept = fetch_xmltv(prov["epg"], ua)
         except Exception as e:
             warn(f"warning: EPG fetch failed ({e}); continuing without EPG")
     return len(channels), 0, kept
@@ -402,7 +530,7 @@ def sync_xtream(prov):
     save_json(VOD_JSON, items)
 
     try:  # full EPG file first, per API docs
-        kept = import_xmltv(fetch(f"{host}/xmltv.php?username={q_user}&password={q_pw}", ua))
+        kept = fetch_xmltv(f"{host}/xmltv.php?username={q_user}&password={q_pw}", ua)
     except Exception as e:
         warn(f"warning: xmltv.php failed ({e}); EPG will be sparse")
         kept = 0
@@ -647,6 +775,8 @@ def main():
             die(f"provider.json missing key {e}")
         except urllib.error.HTTPError as e:
             die(f"provider returned HTTP {e.code} {e.reason}")
+        except ResponseTooLarge as e:
+            die(f"provider response too large: {e}")
         except (urllib.error.URLError, OSError, TimeoutError) as e:
             die(f"network error: {getattr(e, 'reason', e)}")
         except (ValueError, ET.ParseError) as e:

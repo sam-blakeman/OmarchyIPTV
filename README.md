@@ -40,6 +40,18 @@ Advanced: `~/.config/omarchy-iptv/provider.json` (mode 600) still works if you p
 
 Optional `"user_agent"` key if the provider whitelists a player UA.
 
+### Limits
+
+Sync caps what a provider may send, so a broken or hostile server (or a gzip
+bomb) cannot exhaust memory. Larger responses abort with
+`provider response too large` in Setup.
+
+| input | on the wire | after gzip |
+|---|---|---|
+| m3u playlist | 32 MiB | 128 MiB |
+| Xtream JSON (per call) | 32 MiB | 128 MiB |
+| XMLTV guide | 256 MiB | 2 GiB (streamed into sqlite, never held whole) |
+
 Then press 󰑓, or:
 
 ```sh
