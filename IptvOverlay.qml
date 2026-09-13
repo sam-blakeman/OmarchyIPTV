@@ -25,6 +25,8 @@ Item {
   property string filterText: ""
   property string group: "All"
   property int selectedIndex: 0
+  property var openSeries: null
+  readonly property var tabOrder: ["live", "vod", "series"]
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -41,26 +43,59 @@ Item {
   readonly property var sourceGroups: {
     var g = root.tab === "vod"
       ? (svc && svc.vodGroups ? svc.vodGroups : ["All"])
-      : (svc && svc.liveGroups ? svc.liveGroups : Model.groups(svc ? svc.channels : []))
+      : root.tab === "series"
+        ? (svc && svc.seriesGroups ? svc.seriesGroups : ["All"])
+        : (svc && svc.liveGroups ? svc.liveGroups : Model.groups(svc ? svc.channels : []))
     return g && g.length ? g : ["All"]
   }
   readonly property var groupList: [root.favGroup].concat(sourceGroups.filter(function(g) { return g !== root.favGroup }))
   readonly property var livePool: root.group === root.favGroup && svc ? svc.favItems("live") : (svc ? svc.channels : [])
   readonly property var rows: root.tab === "vod"
     ? (root.group === root.favGroup && svc ? svc.favItems("vod") : (svc ? svc.vod : []))
-    : Model.filterChannels(livePool, filterText, root.group === root.favGroup ? "All" : group)
+    : root.tab === "series"
+      ? (root.openSeries
+          ? Model.filterEpisodes(svc ? svc.episodes : [], filterText)
+          : (root.group === root.favGroup && svc ? svc.favItems("series") : (svc ? svc.series : [])))
+      : Model.filterChannels(livePool, filterText, root.group === root.favGroup ? "All" : group)
   readonly property var selected: rows.length > 0 ? rows[Math.min(root.selectedIndex, rows.length - 1)] : null
   readonly property bool vodNeedsQuery: root.tab === "vod" && root.group !== root.favGroup && root.group === "All" && String(root.filterText).trim() === ""
+  readonly property bool inEpisodes: root.tab === "series" && root.openSeries !== null
+  readonly property string episodesHint: {
+    if (!root.inEpisodes || !svc) return ""
+    if (svc.episodesLoading) return "Loading episodes…"
+    if (svc.episodesError) return svc.episodesError
+    return rows.length === 0 ? "No episodes match." : ""
+  }
 
   onRowsChanged: if (root.selectedIndex > rows.length - 1) root.selectedIndex = Math.max(0, rows.length - 1)
-  onTabChanged: root.maybeRequestVod()
+  onTabChanged: { if (root.tab !== "series") root.openSeries = null; root.maybeRequestVod() }
   onGroupChanged: root.maybeRequestVod()
   onFilterTextChanged: root.maybeRequestVod()
 
   function maybeRequestVod() {
-    if (root.tab !== "vod" || !svc || !svc.requestVod) return
+    if (!svc) return
+    if (root.tab === "series") {
+      if (root.openSeries || root.group === root.favGroup || !svc.requestSeries) return
+      svc.requestSeries(root.group, root.filterText)
+      return
+    }
+    if (root.tab !== "vod" || !svc.requestVod) return
     if (root.group === root.favGroup) return
     svc.requestVod(root.group, root.filterText)
+  }
+
+  function openShow(item) {
+    if (!item || !item.id || !svc || !svc.requestEpisodes) return
+    root.openSeries = item
+    root.filterText = ""
+    root.selectedIndex = 0
+    svc.requestEpisodes(item.id, false)
+  }
+  function closeShow() {
+    root.openSeries = null
+    root.filterText = ""
+    root.selectedIndex = 0
+    root.maybeRequestVod()
   }
 
   function open(payloadJson) {
@@ -68,6 +103,7 @@ Item {
     root.filterText = ""
     root.group = "All"
     root.selectedIndex = 0
+    root.openSeries = null
     root.maybeRequestVod()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -102,6 +138,10 @@ Item {
     root.group = "All"
     root.selectedIndex = 0
   }
+  function cycleTab() {
+    var i = root.tabOrder.indexOf(root.tab)
+    root.setTab(root.tabOrder[(i + 1) % root.tabOrder.length])
+  }
   function setFilter(t) {
     root.filterText = t
     root.selectedIndex = 0
@@ -117,14 +157,16 @@ Item {
   function activateCurrent() {
     var it = root.selected
     if (!it || !it.id || it.available === false || !svc) return
-    svc.playChannel(it)
+    if (root.tab === "series" && !root.openSeries) root.openShow(it)
+    else svc.playChannel(it)
   }
   function favCurrent() {
-    var it = root.selected
+    var it = root.inEpisodes ? root.openSeries : root.selected
     if (!it || !it.id || !svc || !svc.toggleFav) return
     svc.toggleFav(root.tab, it)
   }
   function isFav(id) {
+    if (root.inEpisodes) return false
     return svc && svc.isFav ? svc.isFav(root.tab, id) : false
   }
   function nowFor(item) {
@@ -135,7 +177,12 @@ Item {
   }
   function subtitleFor(item) {
     var now = root.nowFor(item)
-    if (!now) return item.group || ""
+    if (!now) {
+      var parts = [item.group || ""]
+      if (item.year) parts.push(item.year)
+      if (item.duration) parts.push(item.duration)
+      return parts.filter(function(s) { return !!s }).join("  ·  ")
+    }
     var next = root.nextFor(item)
     return next ? now + "  ▸ " + next : now
   }
@@ -179,7 +226,11 @@ Item {
         Keys.onPressed: function(event) {
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
+            else if (root.openSeries) root.closeShow()
             else root.dismiss()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Backspace && !root.filterText && root.openSeries) {
+            root.closeShow()
             event.accepted = true
           } else if (event.key === Qt.Key_Up) {
             root.move(-1)
@@ -193,17 +244,17 @@ Item {
           } else if (event.key === Qt.Key_PageDown) {
             root.move(10)
             event.accepted = true
-          } else if (event.key === Qt.Key_Left) {
+          } else if (event.key === Qt.Key_Left && !root.inEpisodes) {
             root.cycleGroup(-1)
             event.accepted = true
-          } else if (event.key === Qt.Key_Right) {
+          } else if (event.key === Qt.Key_Right && !root.inEpisodes) {
             root.cycleGroup(1)
             event.accepted = true
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.activateCurrent()
             event.accepted = true
           } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
-            root.setTab(root.tab === "live" ? "vod" : "live")
+            root.cycleTab()
             event.accepted = true
           } else if (event.key === Qt.Key_F && (event.modifiers & Qt.ControlModifier)) {
             root.favCurrent()
@@ -254,7 +305,8 @@ Item {
             fontFamily: root.fontFamily
             options: [
               { value: "live", label: "Live" },
-              { value: "vod", label: "VOD" }
+              { value: "vod", label: "VOD" },
+              { value: "series", label: "Series" }
             ]
             onChanged: function(v) { root.setTab(v) }
           }
@@ -263,8 +315,9 @@ Item {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: root.filterText !== "" ? "Filter: " + root.filterText + "  (" + rows.length + ")" : "Type to filter  (" + rows.length + ")"
-          color: root.mutedText
+          text: (root.openSeries ? "◀ " + root.openSeries.name + "   " : "")
+            + (root.filterText !== "" ? "Filter: " + root.filterText + "  (" + rows.length + ")" : "Type to filter  (" + rows.length + ")")
+          color: root.openSeries ? root.foreground : root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
@@ -272,8 +325,9 @@ Item {
 
         ListView {
           id: groupStrip
+          visible: !root.inEpisodes
           width: parent.width
-          height: Style.spacing.controlHeight
+          height: root.inEpisodes ? 0 : Style.spacing.controlHeight
           orientation: ListView.Horizontal
           spacing: Style.space(6)
           clip: true
@@ -289,10 +343,16 @@ Item {
         }
 
         Text {
-          visible: root.vodNeedsQuery || rows.length === 0
+          visible: root.vodNeedsQuery || rows.length === 0 || root.episodesHint !== ""
           width: parent.width
           textFormat: Text.PlainText
-          text: root.vodNeedsQuery ? "Pick a group or type to search VOD." : (rows.length === 0 ? "No matches." : "")
+          text: root.episodesHint !== "" ? root.episodesHint
+            : root.vodNeedsQuery ? "Pick a group or type to search VOD."
+            : (rows.length === 0
+                ? (root.tab === "series"
+                    ? (root.group === "All" && String(root.filterText).trim() === "" ? "Pick a group or type to search series." : "No series match (Xtream providers only).")
+                    : "No matches.")
+                : "")
           color: root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -324,7 +384,7 @@ Item {
                 width: Style.space(28)
                 anchors.verticalCenter: parent.verticalCenter
                 textFormat: Text.PlainText
-                text: root.isFav(modelData.id) ? "★" : "☆"
+                text: root.inEpisodes ? "▸" : (root.isFav(modelData.id) ? "★" : "☆")
                 color: root.isFav(modelData.id) ? Color.accent : root.mutedText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.subtitle
@@ -372,7 +432,9 @@ Item {
           width: parent.width
           horizontalAlignment: Text.AlignHCenter
           textFormat: Text.PlainText
-          text: "↑↓ move · ←→ group · Enter play · Ctrl+F favorite · Tab Live/VOD · type to filter · Esc close"
+          text: root.inEpisodes
+            ? "↑↓ move · Enter play · Backspace back · Ctrl+F favorite show · type to filter · Esc back"
+            : "↑↓ move · ←→ group · Enter " + (root.tab === "series" ? "open" : "play") + " · Ctrl+F favorite · Tab Live/VOD/Series · type to filter · Esc close"
           color: root.mutedText
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

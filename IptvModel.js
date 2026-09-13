@@ -11,6 +11,15 @@ function filterChannels(channels, query, group) {
   });
 }
 
+// Episodes are filtered client-side: one show's list is small and already local.
+function filterEpisodes(episodes, query) {
+  var q = String(query || "").toLowerCase();
+  if (!q) return episodes || [];
+  return (episodes || []).filter(function (e) {
+    return String(e.name || "").toLowerCase().indexOf(q) !== -1;
+  });
+}
+
 function groups(channels) {
   var seen = {};
   var out = ["All"];

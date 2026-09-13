@@ -21,6 +21,11 @@ Panel {
 
   readonly property var channels: service ? service.channels : []
   readonly property var vod: service ? service.vod : []
+  readonly property var series: service ? service.series : []
+  readonly property var episodes: service ? service.episodes : []
+  readonly property bool episodesLoading: service ? service.episodesLoading === true : false
+  readonly property string episodesError: service ? service.episodesError : ""
+  property var openSeries: null
   readonly property var epgNow: service ? service.epgNow : []
   readonly property string statusLine: service ? service.statusLine : "IPTV"
   readonly property string lastError: service ? service.lastError : ""
@@ -47,7 +52,7 @@ Panel {
     var s = root.syncStatus
     if (!s || !s.provider) return "No provider configured."
     var out = s.provider + " · synced " + root.ago(service ? service.syncedAtMs : 0)
-      + " · " + (s.channels || 0) + " live, " + (s.vod || 0) + " vod"
+      + " · " + (s.channels || 0) + " live, " + (s.vod || 0) + " vod, " + (s.series || 0) + " series"
     if (s.has_epg) {
       out += " · EPG " + (s.epg_programmes || 0) + " programmes"
       if (s.epg_until) out += ", until " + new Date(s.epg_until * 1000).toLocaleString(Qt.locale(), Locale.ShortFormat)
@@ -61,13 +66,17 @@ Panel {
   readonly property var sourceGroups: {
     var g = root.tab === "vod"
       ? (service && service.vodGroups ? service.vodGroups : ["All"])
-      : (service && service.liveGroups ? service.liveGroups : Model.groups(root.channels))
+      : root.tab === "series"
+        ? (service && service.seriesGroups ? service.seriesGroups : ["All"])
+        : (service && service.liveGroups ? service.liveGroups : Model.groups(root.channels))
     return g && g.length ? g : ["All"]
   }
   readonly property var groupList: [root.favGroup].concat(sourceGroups.filter(function(g) { return g !== root.favGroup }))
   readonly property var livePool: root.group === root.favGroup && service ? service.favItems("live") : root.channels
   readonly property var visibleChannels: Model.filterChannels(livePool, query, root.group === root.favGroup ? "All" : group)
   readonly property var visibleVod: root.group === root.favGroup && service ? service.favItems("vod") : root.vod
+  readonly property var visibleSeries: root.group === root.favGroup && service ? service.favItems("series") : root.series
+  readonly property var visibleEpisodes: Model.filterEpisodes(root.episodes, query)
   readonly property bool vodNeedsQuery: root.tab === "vod" && root.group !== root.favGroup && root.group === "All" && String(root.query).trim() === ""
   readonly property string emptyHint: {
     if (root.tab === "setup") return ""
@@ -76,6 +85,17 @@ Panel {
     if (root.tab === "vod" && root.vodNeedsQuery) return "Pick a group or type to search VOD."
     if (root.tab === "live" && root.visibleChannels.length === 0) return "No channels match."
     if (root.tab === "vod" && root.visibleVod.length === 0) return "No titles match."
+    if (root.tab === "series" && root.openSeries) {
+      if (root.episodesLoading) return "Loading episodes…"
+      if (root.episodesError) return root.episodesError
+      if (root.visibleEpisodes.length === 0) return "No episodes match."
+      return ""
+    }
+    if (root.tab === "series" && root.visibleSeries.length === 0) {
+      if (!(root.syncStatus && root.syncStatus.series)) return "No series from this provider (Xtream only). Re-sync from Setup."
+      if (root.group === "All" && String(root.query).trim() === "") return "Pick a group or type to search " + root.syncStatus.series + " series."
+      return "No series match."
+    }
     if (root.tab === "epg" && root.epgNow.length === 0) return "No guide data yet. Sync from Setup."
     return ""
   }
@@ -85,6 +105,7 @@ Panel {
 
   onTabChanged: {
     if (root.groupList.indexOf(root.group) === -1) root.group = "All"
+    if (root.tab !== "series") root.openSeries = null
     if (root.tab === "setup") root.fillForm()
     root.maybeRequestVod()
   }
@@ -95,9 +116,30 @@ Panel {
   onQueryChanged: root.maybeRequestVod()
 
   function maybeRequestVod() {
-    if (root.tab !== "vod" || !service || !service.requestVod) return
+    if (!service) return
+    if (root.tab === "series") {
+      if (root.openSeries || root.group === root.favGroup || !service.requestSeries) return
+      service.requestSeries(root.group, root.query)
+      return
+    }
+    if (root.tab !== "vod" || !service.requestVod) return
     if (root.group === root.favGroup) return
     service.requestVod(root.group, root.query)
+  }
+
+  function openShow(item) {
+    if (!item || !item.id || !service || !service.requestEpisodes) return
+    root.openSeries = item
+    if (searchField) searchField.text = ""
+    service.requestEpisodes(item.id, false)
+  }
+  function closeShow() {
+    root.openSeries = null
+    if (searchField) searchField.text = ""
+    root.maybeRequestVod()
+  }
+  function refreshShow() {
+    if (root.openSeries && service && service.requestEpisodes) service.requestEpisodes(root.openSeries.id, true)
   }
 
   function fillForm() {
@@ -180,7 +222,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: root.openSeries ? root.closeShow() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
@@ -224,7 +266,7 @@ Panel {
           TextField {
             id: searchField
             Layout.fillWidth: true
-            placeholderText: "Search channels / VOD…"
+            placeholderText: root.openSeries ? "Filter episodes…" : "Search channels / VOD / series…"
             foreground: root.contentForeground
             font.family: root.contentFontFamily
             onTextChanged: root.query = text
@@ -248,6 +290,7 @@ Panel {
           options: [
             { value: "live", label: "Live" },
             { value: "vod", label: "VOD" },
+            { value: "series", label: "Series" },
             { value: "epg", label: "Guide" },
             { value: "setup", label: "Setup" }
           ]
@@ -255,7 +298,44 @@ Panel {
         }
 
         RowLayout {
-          visible: root.tab === "live" || root.tab === "vod"
+          visible: root.tab === "series" && root.openSeries !== null
+          width: parent.width
+          spacing: Style.space(8)
+          PanelActionButton {
+            iconText: "←"
+            tooltipText: "Back to series"
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
+            onClicked: root.closeShow()
+          }
+          Text {
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: root.openSeries ? root.openSeries.name + (root.episodes.length ? "  · " + root.episodes.length + " episodes" : "") : ""
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+          PanelActionButton {
+            iconText: root.isFav("series", root.openSeries ? root.openSeries.id : "") ? "★" : "☆"
+            tooltipText: "Favorite show"
+            foreground: root.isFav("series", root.openSeries ? root.openSeries.id : "") ? Color.accent : root.contentForeground
+            fontFamily: root.contentFontFamily
+            onClicked: root.toggleFav("series", root.openSeries)
+          }
+          PanelActionButton {
+            iconText: "󰑓"
+            tooltipText: "Re-fetch episodes"
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
+            onClicked: root.refreshShow()
+          }
+        }
+
+        RowLayout {
+          visible: root.tab === "live" || root.tab === "vod" || (root.tab === "series" && root.openSeries === null)
           width: parent.width
           spacing: Style.space(8)
           Text {
@@ -304,6 +384,24 @@ Panel {
           clip: true
           model: root.visibleVod
           delegate: vodDelegate
+        }
+
+        ListView {
+          visible: root.tab === "series" && root.openSeries === null
+          width: parent.width
+          height: parent.height - y
+          clip: true
+          model: root.visibleSeries
+          delegate: seriesDelegate
+        }
+
+        ListView {
+          visible: root.tab === "series" && root.openSeries !== null
+          width: parent.width
+          height: parent.height - y
+          clip: true
+          model: root.visibleEpisodes
+          delegate: episodeDelegate
         }
 
         ListView {
@@ -531,6 +629,97 @@ Panel {
       MouseArea {
         anchors.fill: parent
         anchors.leftMargin: Style.space(30)
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.playChannel(modelData)
+      }
+    }
+  }
+
+  Component {
+    id: seriesDelegate
+    Item {
+      required property var modelData
+      width: ListView.view ? ListView.view.width : 600
+      height: Style.space(40)
+      Row {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(4)
+        spacing: Style.space(4)
+        PanelActionButton {
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: root.isFav("series", modelData.id) ? "★" : "☆"
+          tooltipText: root.isFav("series", modelData.id) ? "Remove favorite" : "Add favorite"
+          foreground: root.isFav("series", modelData.id) ? Color.accent : root.contentForeground
+          fontFamily: root.contentFontFamily
+          onClicked: root.toggleFav("series", modelData)
+        }
+        Column {
+          width: parent.width - Style.space(34)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 0
+          Text {
+            width: parent.width
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: modelData.name
+            color: modelData.available === false ? Color.muted : root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+          }
+          Text {
+            width: parent.width
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            text: [modelData.year, modelData.group, modelData.rating ? "★ " + modelData.rating : ""].filter(function(s) { return !!s }).join(" · ")
+            color: Color.muted
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+      MouseArea {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(30)
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.openShow(modelData)
+      }
+    }
+  }
+
+  Component {
+    id: episodeDelegate
+    Item {
+      required property var modelData
+      width: ListView.view ? ListView.view.width : 600
+      height: Style.space(34)
+      Row {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(8)
+        spacing: Style.space(8)
+        Text {
+          width: parent.width - Style.space(90)
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: modelData.name
+          color: root.contentForeground
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.body
+          anchors.verticalCenter: parent.verticalCenter
+        }
+        Text {
+          width: Style.space(74)
+          horizontalAlignment: Text.AlignRight
+          elide: Text.ElideRight
+          textFormat: Text.PlainText
+          text: modelData.duration || ""
+          color: Color.muted
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.caption
+          anchors.verticalCenter: parent.verticalCenter
+        }
+      }
+      MouseArea {
+        anchors.fill: parent
         cursorShape: Qt.PointingHandCursor
         onClicked: root.playChannel(modelData)
       }

@@ -29,6 +29,18 @@ Item {
   property string vodQuery: ""
   property int vodLimit: 400
 
+  // Series: catalog rows come from the sync cache like VOD; a show's
+  // episodes are fetched on demand (one provider call, cached 6h).
+  property var series: []
+  property var seriesGroups: ["All"]
+  property string seriesGroup: "All"
+  property string seriesQuery: ""
+  property int seriesLimit: 400
+  property var episodes: []
+  property string episodesFor: ""
+  property bool episodesLoading: false
+  property string episodesError: ""
+
   property var status: ({})
   readonly property real syncedAtMs: status && status.synced_at ? status.synced_at * 1000 : 0
   readonly property bool providerConfigured: !!(status && status.provider)
@@ -62,6 +74,7 @@ Item {
     if (!dumpChannelsProc.running) dumpChannelsProc.running = true
     if (!dumpLiveGroupsProc.running) dumpLiveGroupsProc.running = true
     if (!dumpVodGroupsProc.running) dumpVodGroupsProc.running = true
+    if (!dumpSeriesGroupsProc.running) dumpSeriesGroupsProc.running = true
     refreshEpg()
     refreshStatus()
     refreshFavRows()
@@ -128,6 +141,30 @@ Item {
   function dumpVodNow() {
     if (dumpVodProc.running) dumpVodProc.running = false
     dumpVodProc.running = true
+  }
+
+  function requestSeries(group, query) {
+    root.seriesGroup = group || "All"
+    root.seriesQuery = query || ""
+    seriesDebounce.restart()
+  }
+
+  function dumpSeriesNow() {
+    if (dumpSeriesProc.running) dumpSeriesProc.running = false
+    dumpSeriesProc.running = true
+  }
+
+  function requestEpisodes(seriesId, force) {
+    if (!seriesId) return
+    var cmd = [root.helperPath(), "--dump-episodes", "--id", String(seriesId)]
+    if (force) cmd.push("--refresh")
+    root.episodesFor = String(seriesId)
+    root.episodes = []
+    root.episodesError = ""
+    root.episodesLoading = true
+    if (dumpEpisodesProc.running) dumpEpisodesProc.running = false
+    dumpEpisodesProc.command = cmd
+    dumpEpisodesProc.running = true
   }
 
   function saveProvider(cfg) {
@@ -297,6 +334,72 @@ Item {
     interval: 180
     repeat: false
     onTriggered: root.dumpVodNow()
+  }
+
+  Process {
+    id: dumpSeriesGroupsProc
+    running: false
+    command: [root.helperPath(), "--dump-groups", "series"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var g = JSON.parse(text || "[]")
+          root.seriesGroups = Array.isArray(g) && g.length ? g : ["All"]
+        } catch (e) { root.seriesGroups = ["All"] }
+      }
+    }
+  }
+
+  Process {
+    id: dumpSeriesProc
+    running: false
+    command: {
+      var cmd = [root.helperPath(), "--dump-series", "--limit", String(root.seriesLimit)]
+      if (root.seriesGroup && root.seriesGroup !== "All") {
+        cmd.push("--group")
+        cmd.push(root.seriesGroup)
+      }
+      if (root.seriesQuery) {
+        cmd.push("--query")
+        cmd.push(root.seriesQuery)
+      }
+      return cmd
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.series = JSON.parse(text || "[]") } catch (e) { root.series = [] }
+      }
+    }
+  }
+
+  Timer {
+    id: seriesDebounce
+    interval: 180
+    repeat: false
+    onTriggered: root.dumpSeriesNow()
+  }
+
+  Process {
+    id: dumpEpisodesProc
+    running: false
+    command: [root.helperPath(), "--dump-episodes", "--id", ""]
+    stdout: StdioCollector { id: episodesOut; waitForEnd: true }
+    stderr: StdioCollector { id: episodesErr; waitForEnd: true }
+    onExited: function(code) {
+      root.episodesLoading = false
+      if (code === 0) {
+        try {
+          var rows = JSON.parse(episodesOut.text || "[]")
+          root.episodes = Array.isArray(rows) ? rows : []
+        } catch (e) { root.episodes = [] }
+        if (!root.episodes.length) root.episodesError = "No episodes listed for this show."
+      } else {
+        var lines = String(episodesErr.text || "").trim().split("\n")
+        root.episodesError = "Episodes failed: " + root.redact(lines.length ? lines[lines.length - 1] : ("exit " + code), "")
+      }
+    }
   }
 
   Process {

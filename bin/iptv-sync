@@ -11,9 +11,10 @@ Reads  ~/.config/omarchy-iptv/provider.json  (one provider):
 
   Optional for both: "user_agent": "..."  (some providers whitelist UAs)
 
-Cache lives in ~/.cache/omarchy-iptv/: channels.json, vod.json, epg.db.
-Only now-2h..now+24h of EPG is kept, so the shell never holds a week
-of listings in memory.
+Cache lives in ~/.cache/omarchy-iptv/: channels.json, vod.json,
+series.json, series/<id>.json (episodes, fetched on demand, 6h TTL),
+epg.db. Only now-2h..now+24h of EPG is kept, so the shell never holds a
+week of listings in memory.
 
 NOTE: stream URLs for Xtream embed the password (required by the
 protocol). They stay in mode-600 cache files. --dump-* for the shell
@@ -43,6 +44,9 @@ CONFIG = os.path.join(CONFIG_DIR, "provider.json")
 CACHE = os.path.expanduser("~/.cache/omarchy-iptv")
 CHANNELS_JSON = os.path.join(CACHE, "channels.json")
 VOD_JSON = os.path.join(CACHE, "vod.json")
+SERIES_JSON = os.path.join(CACHE, "series.json")
+SERIES_DIR = os.path.join(CACHE, "series")  # one <series_id>.json of episodes per show
+EPISODES_TTL = 6 * 3600
 EPG_DB = os.path.join(CACHE, "epg.db")
 TIMEOUT = 60
 DEFAULT_UA = "omarchy-iptv/1.0"
@@ -479,26 +483,101 @@ def sync_m3u(prov):
         die("playlist fetched but no channels parsed; is the url an m3u?")
     save_json(CHANNELS_JSON, channels)
     save_json(VOD_JSON, [])  # m3u has no VOD split in v1
+    save_json(SERIES_JSON, [])  # ...nor a series catalog
     kept = 0
     if prov.get("epg"):
         try:
             kept = fetch_xmltv(prov["epg"], ua)
         except Exception as e:
             warn(f"warning: EPG fetch failed ({e}); continuing without EPG")
-    return len(channels), 0, kept
+    return len(channels), 0, 0, kept
 
 
-def sync_xtream(prov):
+def xtream_api(prov):
+    """(host, api base url with credentials, quoted user, quoted pw, ua)."""
     host = prov["host"].rstrip("/")
     user = prov["username"]
-    ua = prov.get("user_agent")
     pw = get_password(prov)
     if not pw:
         die("xtream password missing: set it in Setup, or secret-tool store "
             f"--label omarchy-iptv application {SECRET_APP} username {user}")
-    SECRETS.append(pw)
+    if pw not in SECRETS:
+        SECRETS.append(pw)
     q_user, q_pw = urllib.parse.quote(user, safe=""), urllib.parse.quote(pw, safe="")
     api = f"{host}/player_api.php?username={q_user}&password={q_pw}"
+    return host, api, q_user, q_pw, prov.get("user_agent")
+
+
+def series_rows(series, cats):
+    """Shell-facing catalog rows for get_series output. Episodes are not
+    fetched here: one get_series_info call per show would turn a sync into
+    thousands of requests, so they load on demand (fetch_episodes)."""
+    rows = []
+    for s in series or []:
+        sid = s.get("series_id")
+        if sid is None:
+            continue
+        release = str(s.get("releaseDate") or s.get("release_date") or "")
+        rows.append({
+            "id": f"xcs-{sid}",
+            "series_id": sid,
+            "name": s.get("name") or f"series {sid}",
+            "logo": s.get("cover") or "",
+            "group": cats.get(str(s.get("category_id")), "Ungrouped"),
+            "plot": (s.get("plot") or "")[:240],
+            "year": release[:4],
+            "rating": str(s.get("rating") or ""),
+            "tvg_id": "",
+        })
+    return rows
+
+
+EPISODE_CODE_RE = re.compile(r"\bS\d{1,2}\s?E\d{1,3}\b", re.IGNORECASE)
+
+
+def episode_rows(info, series_id, host, q_user, q_pw, series_name=""):
+    """Flatten get_series_info into ordered episode rows. Episodes arrive as
+    {"1": [...], "2": [...]} keyed by season, or (some panels) as a list."""
+    eps = (info or {}).get("episodes") or {}
+    if isinstance(eps, list):
+        eps = {str(i + 1): season for i, season in enumerate(eps)}
+    name = series_name or ((info or {}).get("info") or {}).get("name") or ""
+    rows = []
+    for season_key, season in eps.items():
+        for e in season or []:
+            eid = e.get("id")
+            if eid is None:
+                continue
+            try:
+                snum = int(e.get("season") or season_key)
+            except (TypeError, ValueError):
+                snum = 0
+            try:
+                enum = int(e.get("episode_num") or 0)
+            except (TypeError, ValueError):
+                enum = 0
+            title = e.get("title") or f"Episode {enum}"
+            ext = e.get("container_extension") or "mp4"
+            # Many panels already put "S01E02" in the title; don't say it twice.
+            label = title if EPISODE_CODE_RE.search(title) else f"S{snum:02d}E{enum:02d} · {title}"
+            rows.append({
+                "id": f"xce-{series_id}-{eid}",
+                "name": label,
+                "season": snum,
+                "episode": enum,
+                "title": title,
+                "group": f"Season {snum}",
+                "series_name": name,
+                "duration": str((e.get("info") or {}).get("duration") or ""),
+                "url": f"{host}/series/{q_user}/{q_pw}/{eid}.{ext}",
+                "tvg_id": "",
+            })
+    rows.sort(key=lambda r: (r["season"], r["episode"]))
+    return rows
+
+
+def sync_xtream(prov):
+    host, api, q_user, q_pw, ua = xtream_api(prov)
 
     def cats(action):
         return {str(c.get("category_id")): c.get("category_name") or "Ungrouped"
@@ -508,6 +587,12 @@ def sync_xtream(prov):
     vod_cats = cats("get_vod_categories")
     live = fetch_json(f"{api}&action=get_live_streams", ua)
     vod = fetch_json(f"{api}&action=get_vod_streams", ua)
+    try:  # older panels have no series catalog; that is not a failed sync
+        series = series_rows(fetch_json(f"{api}&action=get_series", ua),
+                             cats("get_series_categories"))
+    except (urllib.error.HTTPError, ValueError, ResponseTooLarge) as e:
+        warn(f"warning: series catalog unavailable ({e}); continuing without series")
+        series = []
 
     channels = [{
         "id": f"xc-{s.get('stream_id')}",
@@ -528,13 +613,45 @@ def sync_xtream(prov):
     } for s in vod]
     save_json(CHANNELS_JSON, channels)
     save_json(VOD_JSON, items)
+    save_json(SERIES_JSON, series)
 
     try:  # full EPG file first, per API docs
         kept = fetch_xmltv(f"{host}/xmltv.php?username={q_user}&password={q_pw}", ua)
     except Exception as e:
         warn(f"warning: xmltv.php failed ({e}); EPG will be sparse")
         kept = 0
-    return len(channels), len(items), kept
+    return len(channels), len(items), len(series), kept
+
+
+def episodes_path(series_id):
+    return os.path.join(SERIES_DIR, f"{int(series_id)}.json")
+
+
+def fetch_episodes(series_id, force=False):
+    """Episode rows for one show, from the per-show cache when fresh, else
+    one get_series_info call. Rows keep stream urls (mode-600 file); dumps
+    slim them like every other list."""
+    path = episodes_path(series_id)
+    if not force:
+        try:
+            if time.time() - os.stat(path).st_mtime < EPISODES_TTL:
+                return load_json(path)
+        except OSError:
+            pass
+    prov = load_provider()
+    if not prov or prov.get("type") != "xtream":
+        die("series need an xtream provider", 2)
+    host, api, q_user, q_pw, ua = xtream_api(prov)
+    name = ""
+    for row in load_json(SERIES_JSON):
+        if str(row.get("series_id")) == str(series_id):
+            name = row.get("name") or ""
+            break
+    info = fetch_json(f"{api}&action=get_series_info&series_id={int(series_id)}", ua)
+    rows = episode_rows(info, int(series_id), host, q_user, q_pw, name)
+    os.makedirs(SERIES_DIR, exist_ok=True)
+    save_json(path, rows)
+    return rows
 
 
 def save_json(path, obj):
@@ -619,8 +736,48 @@ def dump_vod(query="", group="", limit=0):
     dump_rows(VOD_JSON, query, group, limit, with_epg=False)
 
 
+SERIES_LIST_ALL_MAX = 2000
+
+
+def dump_series(query="", group="", limit=0):
+    """A small catalog lists unfiltered; a huge one (some providers carry
+    tens of thousands of shows) needs a group or a query first, like VOD."""
+    rows = load_json(SERIES_JSON)
+    if not query and group in ("", "All") and len(rows) > SERIES_LIST_ALL_MAX:
+        json.dump([], sys.stdout)
+        return
+    q = (query or "").lower()
+    out = []
+    for c in rows:
+        if not (row_matches(c, query, group) or (q and q in (c.get("plot") or "").lower())):
+            continue
+        out.append(slim(c))
+        if limit and len(out) >= limit:
+            break
+    json.dump(out, sys.stdout)
+
+
+def dump_episodes(sid, force=False):
+    sid = str(sid or "")
+    if sid.startswith("xcs-"):
+        sid = sid[4:]
+    if not sid.isdigit():
+        die("dump-episodes needs --id xcs-<series_id>", 2)
+    try:
+        rows = fetch_episodes(sid, force)
+    except urllib.error.HTTPError as e:
+        die(f"provider returned HTTP {e.code} {e.reason}")
+    except ResponseTooLarge as e:
+        die(f"provider response too large: {e}")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        die(f"network error: {getattr(e, 'reason', e)}")
+    except ValueError as e:
+        die(f"bad provider response: {e}")
+    json.dump([slim(r) for r in rows], sys.stdout)
+
+
 def dump_groups(kind):
-    path = VOD_JSON if kind == "vod" else CHANNELS_JSON
+    path = {"vod": VOD_JSON, "series": SERIES_JSON}.get(kind, CHANNELS_JSON)
     json.dump(group_names(load_json(path)), sys.stdout)
 
 
@@ -631,7 +788,7 @@ def dump_ids(ids_csv):
         return
     now, by_ch = epg_window()
     out = []
-    for path, with_epg in ((CHANNELS_JSON, True), (VOD_JSON, False)):
+    for path, with_epg in ((CHANNELS_JSON, True), (VOD_JSON, False), (SERIES_JSON, False)):
         for c in load_json(path):
             if str(c.get("id")) not in want:
                 continue
@@ -648,6 +805,13 @@ def play_url(sid):
     sid = str(sid or "")
     if not sid:
         die("play-url needs --id", 2)
+    m = re.match(r"xce-(\d+)-(\d+)$", sid)
+    if m:  # episode: resolve from the show's cache, refetching if it aged out
+        for row in fetch_episodes(m.group(1)):
+            if str(row.get("id")) == sid and row.get("url"):
+                sys.stdout.write(row["url"])
+                return
+        die("unknown episode id", 2)
     for path in (CHANNELS_JSON, VOD_JSON):
         for row in load_json(path):
             if str(row.get("id")) == sid and row.get("url"):
@@ -698,6 +862,7 @@ def dump_status():
         "synced_at": synced_at,
         "channels": len(load_json(CHANNELS_JSON)),
         "vod": len(load_json(VOD_JSON)),
+        "series": len(load_json(SERIES_JSON)),
         "epg_programmes": epg_count,
         "epg_until": epg_until,
     }, sys.stdout)
@@ -726,9 +891,11 @@ def main():
     g.add_argument("--sync", action="store_true")
     g.add_argument("--dump-channels", action="store_true")
     g.add_argument("--dump-vod", action="store_true")
+    g.add_argument("--dump-series", action="store_true")
+    g.add_argument("--dump-episodes", action="store_true")
     g.add_argument("--dump-epg-now", action="store_true")
     g.add_argument("--dump-status", action="store_true")
-    g.add_argument("--dump-groups", choices=["live", "vod"])
+    g.add_argument("--dump-groups", choices=["live", "vod", "series"])
     g.add_argument("--dump-ids", metavar="IDS")
     g.add_argument("--play-url", action="store_true")
     g.add_argument("--write-provider", action="store_true")
@@ -736,6 +903,7 @@ def main():
     ap.add_argument("--query", default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--id", default="")
+    ap.add_argument("--refresh", action="store_true", help="with --dump-episodes: bypass the cache")
     ap.add_argument("--type", dest="prov_type", default="")
     ap.add_argument("--host", default="")
     ap.add_argument("--username", default="")
@@ -751,6 +919,10 @@ def main():
         dump_channels(a.query, a.group, a.limit)
     elif a.dump_vod:
         dump_vod(a.query, a.group, a.limit)
+    elif a.dump_series:
+        dump_series(a.query, a.group, a.limit)
+    elif a.dump_episodes:
+        dump_episodes(a.id, a.refresh)
     elif a.dump_epg_now:
         dump_epg_now()
     elif a.dump_status:
@@ -770,9 +942,9 @@ def main():
         t = prov.get("type")
         try:
             if t == "m3u":
-                nc, nv, ne = sync_m3u(prov)
+                nc, nv, ns, ne = sync_m3u(prov)
             elif t == "xtream":
-                nc, nv, ne = sync_xtream(prov)
+                nc, nv, ns, ne = sync_xtream(prov)
             else:
                 die("provider type must be 'm3u' or 'xtream'")
         except KeyError as e:
@@ -785,7 +957,7 @@ def main():
             die(f"network error: {getattr(e, 'reason', e)}")
         except (ValueError, ET.ParseError) as e:
             die(f"bad provider response: {e}")
-        print(f"synced: {nc} live, {nv} vod, {ne} epg programmes")
+        print(f"synced: {nc} live, {nv} vod, {ns} series, {ne} epg programmes")
 
 
 if __name__ == "__main__":

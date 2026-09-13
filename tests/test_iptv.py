@@ -89,6 +89,107 @@ class DumpVodGuard(unittest.TestCase):
             os.unlink(buf.name)
 
 
+class Series(unittest.TestCase):
+    INFO = {
+        "info": {"name": "Show"},
+        "episodes": {
+            "2": [{"id": 20, "episode_num": "1", "season": 2, "title": "Two-One",
+                   "container_extension": "mkv", "info": {"duration": "00:41:00"}}],
+            "1": [{"id": 11, "episode_num": 2, "title": "One-Two"},
+                  {"id": 10, "episode_num": 1, "title": "One-One"}],
+        },
+    }
+
+    def test_series_rows_map_catalog(self):
+        rows = sync.series_rows(
+            [{"series_id": 7, "name": "Show", "category_id": 3, "cover": "http://c",
+              "plot": "p" * 500, "releaseDate": "2019-05-01", "rating": 8}],
+            {"3": "Drama"})
+        self.assertEqual(rows[0]["id"], "xcs-7")
+        self.assertEqual(rows[0]["group"], "Drama")
+        self.assertEqual(rows[0]["year"], "2019")
+        self.assertEqual(len(rows[0]["plot"]), 240)
+        self.assertNotIn("logo", sync.slim(rows[0]))
+
+    def test_episode_rows_flatten_and_order(self):
+        rows = sync.episode_rows(self.INFO, 7, "http://h", "u", "p")
+        self.assertEqual([r["id"] for r in rows], ["xce-7-10", "xce-7-11", "xce-7-20"])
+        self.assertEqual(rows[0]["name"], "S01E01 · One-One")
+        self.assertEqual(rows[2]["group"], "Season 2")
+        self.assertEqual(rows[2]["url"], "http://h/series/u/p/20.mkv")
+        self.assertEqual(rows[0]["url"], "http://h/series/u/p/10.mp4")
+        self.assertEqual(rows[2]["duration"], "00:41:00")
+        self.assertEqual(rows[0]["series_name"], "Show")
+
+    def test_episode_title_with_code_is_not_prefixed_twice(self):
+        info = {"episodes": {"1": [{"id": 5, "episode_num": 3, "title": "Show - S01E03 - Pilot"}]}}
+        rows = sync.episode_rows(info, 9, "http://h", "u", "p")
+        self.assertEqual(rows[0]["name"], "Show - S01E03 - Pilot")
+
+    def test_episode_rows_accept_list_form(self):
+        info = {"episodes": [[{"id": 1, "episode_num": 1, "title": "a"}],
+                             [{"id": 2, "episode_num": 1, "title": "b"}]]}
+        rows = sync.episode_rows(info, 3, "http://h", "u", "p")
+        self.assertEqual([(r["season"], r["id"]) for r in rows], [(1, "xce-3-1"), (2, "xce-3-2")])
+
+    def test_dump_series_lists_all_and_matches_plot(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as d:
+            old = sync.SERIES_JSON
+            sync.SERIES_JSON = os.path.join(d, "series.json")
+            try:
+                sync.save_json(sync.SERIES_JSON, [
+                    {"id": "xcs-1", "name": "Pirates", "group": "Anime", "plot": "straw hat crew", "logo": "x"},
+                    {"id": "xcs-2", "name": "Office", "group": "Comedy", "plot": "paper company", "logo": "x"}])
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    sync.dump_series("", "All", 400)  # a small catalog lists unfiltered
+                self.assertEqual([r["id"] for r in json.loads(out.getvalue())], ["xcs-1", "xcs-2"])
+                old_max = sync.SERIES_LIST_ALL_MAX
+                sync.SERIES_LIST_ALL_MAX = 1  # ...a huge one needs a group or query, like VOD
+                try:
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        sync.dump_series("", "All", 400)
+                    self.assertEqual(json.loads(out.getvalue()), [])
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        sync.dump_series("", "Comedy", 400)
+                    self.assertEqual([r["id"] for r in json.loads(out.getvalue())], ["xcs-2"])
+                finally:
+                    sync.SERIES_LIST_ALL_MAX = old_max
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    sync.dump_series("straw hat", "All", 400)
+                rows = json.loads(out.getvalue())
+                self.assertEqual([r["id"] for r in rows], ["xcs-1"])
+                self.assertNotIn("logo", rows[0])
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    sync.dump_groups("series")
+                self.assertEqual(json.loads(out.getvalue()), ["All", "Anime", "Comedy"])
+            finally:
+                sync.SERIES_JSON = old
+
+    def test_play_url_resolves_episode_from_cache(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as d:
+            old = sync.SERIES_DIR
+            sync.SERIES_DIR = os.path.join(d, "series")
+            try:
+                os.makedirs(sync.SERIES_DIR)
+                rows = sync.episode_rows(self.INFO, 7, "http://h", "u", "p")
+                sync.save_json(sync.episodes_path(7), rows)  # fresh cache: no network needed
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    sync.play_url("xce-7-11")
+                self.assertEqual(out.getvalue(), "http://h/series/u/p/11.mp4")
+            finally:
+                sync.SERIES_DIR = old
+
+
 class BoundedReaderLimits(unittest.TestCase):
     MIB = 1 << 20
 

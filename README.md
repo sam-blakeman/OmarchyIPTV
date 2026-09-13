@@ -2,7 +2,8 @@
 
 Lightweight single-provider IPTV browser for Omarchy Quattro.
 
-* **One provider**: m3u playlist **or** Xtream Codes (Live + VOD)
+* **One provider**: m3u playlist **or** Xtream Codes (Live + VOD + Series)
+* **Series** (Xtream): browse or search shows by category, open one for its seasons and episodes, play an episode in mpv. The catalog syncs with everything else; a show's episodes are fetched on demand (one `get_series_info` call, cached 6 h under `~/.cache/omarchy-iptv/series/`). Favorite a show with ★. A catalog over 2000 shows asks for a group or a query first, like VOD.
 * **EPG**: XMLTV (`epg` url for m3u, `xmltv.php` for Xtream), now/next only — no week-long grids in memory
 * **Themed**: zero hardcoded colors; every surface uses `Color` / `Style` / `Border` shell tokens, so theme switches apply live
 * **Light**: QML is browser-only; playback is an external `mpv` window. Stream URLs stay out of the shell. VOD is searched on demand rather than loaded in full.
